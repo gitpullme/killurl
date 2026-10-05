@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KillURL</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="popup-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-section">
+        <div class="logo-icon">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="14" cy="14" r="12" stroke="url(#grad1)" stroke-width="2.5" fill="none" />
+            <path d="M9 14L12 17L19 10" stroke="url(#grad2)" stroke-width="2.5" stroke-linecap="round"
+              stroke-linejoin="round" />
+            <line x1="8" y1="8" x2="20" y2="20" stroke="#ef4444" stroke-width="2" stroke-linecap="round"
+              opacity="0.6" />
+            <defs>
+              <linearGradient id="grad1" x1="2" y1="2" x2="26" y2="26">
+                <stop offset="0%" stop-color="#818cf8" />
+                <stop offset="100%" stop-color="#a78bfa" />
+              </linearGradient>
+              <linearGradient id="grad2" x1="9" y1="10" x2="19" y2="17">
+                <stop offset="0%" stop-color="#34d399" />
+                <stop offset="100%" stop-color="#6ee7b7" />
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <h1>KillURL</h1>
+          <span class="tagline">Countdown Killer</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="powerIconBtn" class="icon-btn power" title="Turn extension off">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+            <line x1="12" y1="2" x2="12" y2="12" />
+          </svg>
+        </button>
+        <button id="settingsBtn" class="icon-btn" title="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Master On/Off Switch -->
+    <div class="master-section">
+      <button class="master-btn enabled" id="powerToggleBtn" title="Turn extension off">
+        <span class="master-dot" id="masterDot"></span>
+        <span class="master-text">
+          <span class="master-title" id="masterTitle">Extension ON</span>
+          <span class="master-subtitle" id="masterSubtitle">Click to turn off</span>
+        </span>
+        <span class="master-switch-visual" id="masterSwitchVisual">
+          <span class="master-knob"></span>
+        </span>
+      </button>
+      <!-- Accessible checkbox mirror for the master state (kept in sync, visually hidden) -->
+      <input type="checkbox" id="masterToggle" class="visually-hidden" checked>
+    </div>
+
+    <!-- Status Section -->
+    <div class="status-section" id="statusSection">
+      <div class="status-card" id="statusCard">
+        <div class="status-indicator" id="statusIndicator">
+          <div class="pulse-ring"></div>
+          <div class="status-dot"></div>
+        </div>
+        <div class="status-info">
+          <span class="status-label" id="statusLabel">Scanning page...</span>
+          <span class="status-detail" id="statusDetail">Checking for countdowns</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Destination URL -->
+    <div class="destination-section hidden" id="destinationSection">
+      <div class="destination-label">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+        Destination Found
+      </div>
+      <div class="destination-url" id="destinationUrl" title="Click to copy"></div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="actions-section">
+      <button class="action-btn primary" id="skipBtn">
+        <div class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 4 15 12 5 20 5 4" />
+            <line x1="19" y1="5" x2="19" y2="19" />
+          </svg>
+        </div>
+        <div class="btn-content">
+          <span class="btn-title">Skip Countdown</span>
+          <span class="btn-subtitle">Kill timer & reveal button</span>
+        </div>
+      </button>
+
+      <button class="action-btn accent" id="redirectBtn">
+        <div class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 17l5-5-5-5M6 17l5-5-5-5" />
+          </svg>
+        </div>
+        <div class="btn-content">
+          <span class="btn-title">Direct Redirect</span>
+          <span class="btn-subtitle">Go to final destination</span>
+        </div>
+      </button>
+
+      <button class="action-btn secondary" id="scanBtn">
+        <div class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+        </div>
+        <div class="btn-content">
+          <span class="btn-title">Re-scan Page</span>
+          <span class="btn-subtitle">Detect countdowns again</span>
+        </div>
+      </button>
+
+      <button class="action-btn secondary" id="removeAdBlockBtn">
+        <div class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            <line x1="4" y1="4" x2="20" y2="20" />
+          </svg>
+        </div>
+        <div class="btn-content">
+          <span class="btn-title">Remove Ad-Block Wall</span>
+          <span class="btn-subtitle">Dismiss "disable ad blocker" popups</span>
+        </div>
+      </button>
+
+      <button class="action-btn drm-bypass" id="drmBypassBtn">
+        <div class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+            <line x1="8" y1="21" x2="16" y2="21" />
+            <line x1="12" y1="17" x2="12" y2="21" />
+            <polygon points="10 8 10 12 14 10 10 8" fill="currentColor" />
+          </svg>
+        </div>
+        <div class="btn-content">
+          <span class="btn-title">Screen Share Mode</span>
+          <span class="btn-subtitle">Bypass DRM for screen sharing</span>
+        </div>
+      </button>
+    </div>
+
+    <!-- Quick Settings -->
+    <div class="quick-settings">
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-label">Auto-Skip</span>
+          <span class="setting-desc">Skip countdown automatically</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="autoSkipToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-label">Auto-Redirect</span>
+          <span class="setting-desc">Jump to destination directly</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="autoRedirectToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-label">Aggressive Mode</span>
+          <span class="setting-desc">Bypass Cloudflare-protected timers</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="aggressiveModeToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <span class="setting-label">Auto-Remove Ad Walls</span>
+          <span class="setting-desc">Auto-dismiss ad-blocker popups</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="removeAdBlockToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row stealth-setting">
+        <div class="setting-info">
+          <span class="setting-label">AdBlock Stealth</span>
+          <span class="setting-desc">Fool sites into seeing "no ad blocker"</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="adblockStealthToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row drm-setting">
+        <div class="setting-info">
+          <span class="setting-label">Screen Share DRM</span>
+          <span class="setting-desc">Auto-bypass on streaming sites</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="screenShareDRMToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <span id="versionLabel">KillURL</span>
+      <span class="separator">•</span>
+      <span id="siteCount">70+ sites supported</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>

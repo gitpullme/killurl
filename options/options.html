@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KillURL — Settings</title>
+    <link rel="stylesheet" href="options.css">
+</head>
+
+<body>
+    <div class="options-container">
+        <!-- Header -->
+        <header class="options-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <div class="logo-icon">
+                        <svg width="32" height="32" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <circle cx="14" cy="14" r="12" stroke="url(#g1)" stroke-width="2.5" fill="none" />
+                            <path d="M9 14L12 17L19 10" stroke="url(#g2)" stroke-width="2.5" stroke-linecap="round"
+                                stroke-linejoin="round" />
+                            <line x1="8" y1="8" x2="20" y2="20" stroke="#ef4444" stroke-width="2" stroke-linecap="round"
+                                opacity="0.6" />
+                            <defs>
+                                <linearGradient id="g1" x1="2" y1="2" x2="26" y2="26">
+                                    <stop offset="0%" stop-color="#818cf8" />
+                                    <stop offset="100%" stop-color="#a78bfa" />
+                                </linearGradient>
+                                <linearGradient id="g2" x1="9" y1="10" x2="19" y2="17">
+                                    <stop offset="0%" stop-color="#34d399" />
+                                    <stop offset="100%" stop-color="#6ee7b7" />
+                                </linearGradient>
+                            </defs>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1>KillURL Settings</h1>
+                        <p class="subtitle">Configure your countdown killing preferences</p>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Settings Content -->
+        <main class="settings-main">
+            <!-- Automation Section -->
+            <section class="settings-section">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                        <path d="M2 17l10 5 10-5" />
+                        <path d="M2 12l10 5 10-5" />
+                    </svg>
+                    Automation
+                </h2>
+
+                <div class="setting-card">
+                    <div class="setting-row master-row">
+                        <div class="setting-info">
+                            <h3>Enable KillURL</h3>
+                            <p>Master switch — turn the entire extension off or on. When off, no detection,
+                                skipping, or DRM bypass runs on any page.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="enabled">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Auto-Skip Countdowns</h3>
+                            <p>Automatically skip countdown timers when a URL shortener page is detected.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="autoSkip">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Auto-Redirect to Destination</h3>
+                            <p>Automatically navigate to the final destination URL, bypassing the shortener page
+                                entirely.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="autoRedirect">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Show Notifications</h3>
+                            <p>Display a notification when a countdown is detected or skipped.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="showNotification">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Skip Delay (ms)</h3>
+                            <p>Wait this many milliseconds before auto-skipping. Increase if some sites need more time
+                                to load.</p>
+                        </div>
+                        <input type="number" id="skipDelay" class="number-input" min="0" max="10000" step="100"
+                            value="500">
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Aggressive Mode</h3>
+                            <p>Re-activate timer bypass after Cloudflare challenges complete. Enable this if shortener
+                                pages use Cloudflare protection that blocks normal skipping.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="aggressiveMode">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Auto-Remove Ad-Block Walls</h3>
+                            <p>Automatically remove "disable your ad blocker" overlays and popups on every page.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="removeAdBlockWalls">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>AdBlock Stealth</h3>
+                            <p>Fool adblock detectors into thinking no ad blocker is installed — bait ads report as
+                                loaded and visible. Fixes Continue buttons that stay dead while your ad blocker is on.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="adblockStealth">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Screen Share DRM Bypass</h3>
+                            <p>Automatically bypass DRM video protection on streaming platforms (Netflix, Disney+, Prime
+                                Video, etc.) so video content is visible when screen sharing. Requires page reload after
+                                enabling.</p>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="screenShareDRM">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Site Scope Section -->
+            <section class="settings-section">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="2" y1="12" x2="22" y2="12" />
+                        <path
+                            d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                    </svg>
+                    Site Scope
+                </h2>
+
+                <div class="setting-card">
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <h3>Active On</h3>
+                            <p>Choose which sites KillURL should actively monitor.</p>
+                        </div>
+                        <select id="enabledSites" class="select-input">
+                            <option value="all">All websites</option>
+                            <option value="known">Known shorteners only</option>
+                            <option value="custom">Custom list only</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-row column" id="customSitesRow">
+                        <div class="setting-info full">
+                            <h3>Custom Sites</h3>
+                            <p>Add custom domains (one per line) where KillURL should activate. Use domain names without
+                                <code>https://</code>.
+                            </p>
+                        </div>
+                        <textarea id="customSites" class="textarea-input" rows="5"
+                            placeholder="example.com&#10;another-shortener.net&#10;mysite.io"></textarea>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Supported Sites Section -->
+            <section class="settings-section">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M9 11l3 3L22 4" />
+                        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                    </svg>
+                    Supported Sites
+                </h2>
+
+                <div class="setting-card">
+                    <p class="info-text">KillURL supports <strong id="siteCount">70+</strong> URL shortener and file
+                        hosting sites with countdown timers. Here are some of the popular ones:</p>
+
+                    <div class="site-grid" id="siteGrid">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- About Section -->
+            <section class="settings-section">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="16" x2="12" y2="12" />
+                        <line x1="12" y1="8" x2="12.01" y2="8" />
+                    </svg>
+                    About
+                </h2>
+
+                <div class="setting-card">
+                    <div class="about-content">
+                        <p><strong>KillURL</strong> <span id="aboutVersion">v1.2.4</span></p>
+                        <p class="muted">Skip countdown timers and bypass URL shortener pages instantly.</p>
+                        <p class="muted" style="margin-top: 8px;">The extension works by detecting countdown timers,
+                            revealing hidden continue/skip buttons, and finding destination URLs embedded in page
+                            scripts.</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Save Bar -->
+        <div class="save-bar" id="saveBar">
+            <div class="save-bar-content">
+                <span>You have unsaved changes</span>
+                <div class="save-actions">
+                    <button class="save-btn secondary" id="resetBtn">Reset</button>
+                    <button class="save-btn primary" id="saveBtn">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="options.js"></script>
+</body>
+
+</html>
