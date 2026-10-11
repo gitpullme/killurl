@@ -77,28 +77,44 @@ async function resolveShortenerUrl(shortUrl) {
 }
 
 // Clean up any legacy learned slow-down records on startup so no site stays trapped in 25-120s waits
-(async () => {
-    try {
-        await chrome.storage.local.remove(LEARNED_PATIENT_STORE);
-        patientTabs.clear();
-        console.log('[KillURL] Cleared legacy slow-down patient store — fast server skip engine active');
-    } catch (e) { /* ignore */ }
-})();
-
 const LEARNED_PATIENT_STORE = 'kuLearnedPatientHosts';
 const LEARNED_PATIENT_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+
+function isCaptchaShortenerHost(h) {
+    if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES && typeof KILLURL_SITES.isCaptchaShortener === 'function') {
+        return KILLURL_SITES.isCaptchaShortener(h);
+    }
+    const host = String(h || '').toLowerCase().replace(/^www\./, '');
+    return host === 'vplink.in' || host.endsWith('.vplink.in') || host === 'vplinks.in' || host.endsWith('.vplinks.in');
+}
+
+// Clean up any mistakenly learned captcha shortener domains from persistent storage on startup
+(async () => {
+    try {
+        const o = await chrome.storage.local.get(LEARNED_PATIENT_STORE);
+        const list = o?.[LEARNED_PATIENT_STORE] || [];
+        const filtered = list.filter(e => {
+            const h = e?.h || '';
+            return !isCaptchaShortenerHost(h);
+        });
+        if (filtered.length !== list.length) {
+            await chrome.storage.local.set({ [LEARNED_PATIENT_STORE]: filtered });
+            console.log('[KillURL] Purged captcha shortener domains from learned patient store');
+        }
+    } catch (e) { /* ignore */ }
+})();
 
 async function getLearnedPatientHosts() {
     try {
         const o = await chrome.storage.local.get(LEARNED_PATIENT_STORE);
         const now = Date.now();
         return ((o && o[LEARNED_PATIENT_STORE]) || [])
-            .filter(e => e && typeof e.h === 'string' && (now - (e.t || 0)) < LEARNED_PATIENT_TTL_MS);
+            .filter(e => e && typeof e.h === 'string' && !isCaptchaShortenerHost(e.h) && (now - (e.t || 0)) < LEARNED_PATIENT_TTL_MS);
     } catch (e) { return []; }
 }
 
 async function learnPatientHost(host, requiredSeconds) {
-    if (!host) return;
+    if (!host || isCaptchaShortenerHost(host)) return;
     try {
         const list = await getLearnedPatientHosts();
         // Cap required wait to 3-4s max - never lock into 25-120s stalls
@@ -627,6 +643,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
                     // Error, penalty, or honeypot pages are NEVER an arrival!
                     if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl && KILLURL_SITES.isErrorUrl(message.url)) {
+                        if (tabId != null) {
+                            lastDestinationByTab.delete(tabId);
+                            visitHistoryByTab.delete(tabId);
+                            patientTabs.delete(tabId);
+                            await persistTabState();
+                        }
                         sendResponse({ arrived: false, isError: true });
                         return;
                     }
@@ -708,6 +730,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     const tabId = sender.tab?.id;
                     if (tabId != null && message.url) {
                         const curHost = hostOf(message.url);
+
+                        // Captcha shorteners (e.g. vplink.in) host challenges and are visited at the start
+                        // and naturally revisited at the end to get the download. NEVER treat them as loops or bounces!
+                        if (isCaptchaShortenerHost(curHost)) {
+                            sendResponse({ loop: false, learned: false, visits: 1, hostVisits: 1, required: null, malleable: false, strict: false, bounces: 0 });
+                            return;
+                        }
 
                         // 0. Resolve any in-flight malleability probe from the
                         // previous page in this tab. A FRESH step key means the

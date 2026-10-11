@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "KillURL - URL Shortener Bypass",
-    "version": "1.4.2",
+    "version": "1.4.3",
     "description": "Skip countdown timers and bypass URL shortener pages instantly. Get the final destination URL with one click.",
     "browser_specific_settings": {
         "gecko": {

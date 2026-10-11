@@ -12,6 +12,17 @@
 (function () {
     'use strict';
 
+    // Completely dormant in Cloudflare Turnstile, reCAPTCHA, and hCaptcha challenge iframes
+    const frameHost = (window.location.hostname || '').toLowerCase();
+    if (
+        frameHost.includes('challenges.cloudflare.com') ||
+        frameHost.includes('challenge-platform') ||
+        frameHost.includes('recaptcha.net') ||
+        frameHost.includes('hcaptcha.com')
+    ) {
+        return;
+    }
+
     // ===== STATE =====
     let isShortenerPage = false;
     let isKnownShortener = false; // Confirmed via background domain list
@@ -325,6 +336,38 @@
             captchaGateOpened = true;
             console.log('[KillURL] Captcha / Turnstile verified successfully! Gate opened.');
             isSecurityPage = false;
+
+            if (isCaptchaShortenerDomain()) {
+                // On captcha shortener domains (e.g. vplink.in), the site's own script sends
+                // the Turnstile token to the server via AJAX. We MUST NOT double-submit the form
+                // or press buttons prematurely, as duplicate token submission causes "Verification failed"!
+                // Instead, watch for the page's AJAX to populate the Get Link button with the authentic final URL.
+                let pollAttempts = 0;
+                const pollInterval = setInterval(() => {
+                    pollAttempts++;
+                    findDestinationUrl();
+                    if (destinationUrl && !isErrorDestination(destinationUrl)) {
+                        clearInterval(pollInterval);
+                        return;
+                    }
+                    const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #btn-main, a.btn-main');
+                    if (btn) {
+                        const href = (btn.getAttribute('href') || btn.href || '').trim();
+                        if (href && isValidDestination(href) && !isErrorDestination(href)) {
+                            clearInterval(pollInterval);
+                            console.log('[KillURL] Captcha shortener destination ready on CTA:', href);
+                            navigateOrClick(btn);
+                            return;
+                        }
+                    }
+                    if (pollAttempts >= 40) {
+                        clearInterval(pollInterval);
+                        clickContinueButton();
+                    }
+                }, 500);
+                return;
+            }
+
             setTimeout(() => {
                 if (!isEnabled()) return;
                 if (destinationUrl) return;
@@ -1154,6 +1197,10 @@
     function maybeAutoSkip() {
         if (!isEnabled()) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
+        if (isCaptchaShortenerDomain()) {
+            console.log('[KillURL] Captcha shortener domain — auto-skip standing by for captcha completion');
+            return;
+        }
         if (skipAttempted) return;
         if (!settings.autoSkip) return;
         // NOTE: no late-patient heuristic here. Patient engagement comes only
@@ -2073,6 +2120,7 @@
     // detached signature may or may not verify) — used ONLY by the one-shot
     // probe, never by the steady-state malleable path.
     function ageFormTokens(form, targetMs, allowProbeOnly) {
+        if (isCaptchaShortenerDomain() || isSecurityPage) return 0;
         let n = 0;
         try {
             form.querySelectorAll('input[type="hidden"], input[style*="display: none"], input[style*="display:none"]').forEach(inp => {
@@ -2107,6 +2155,7 @@
     // ageable token present). Reports PROBE_STARTED so the background scores
     // the outcome on the next page load (fresh step = malleable wins).
     function tryBackdateProbe(form, btn) {
+        if (isCaptchaShortenerDomain() || isSecurityPage) return false;
         if (probeTried || hostStrict || !patientMode) return false;
         if (hostBounces < 2) return false;
         let n = 0;
@@ -2199,6 +2248,7 @@
 
     function submitTokenFormIfReady() {
         if (!canAutoAct()) return false;
+        if (isCaptchaShortenerDomain()) return false;
         // Unloading (navigation already won) — submitting now can only fork
         // a stray duplicate tab.
         if (unloading) return false;
@@ -2743,6 +2793,7 @@
     }
 
     function revealHiddenElements() {
+        if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return;
         const allSelectors = [...HIDDEN_DURING_COUNTDOWN, ...DESTINATION_SELECTORS];
         const processed = new Set();
 
@@ -2778,6 +2829,7 @@
     }
 
     function forceEnableButtons() {
+        if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return;
         document.querySelectorAll('a, button, input[type="submit"], input[type="button"], [role="button"]').forEach(el => {
             const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
             if (!text) return;
@@ -2830,6 +2882,7 @@
     }
 
     function removeOverlays() {
+        if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return;
         // Click-ads instruction modals + watch-ad gates first (they gate the
         // whole step; full interference allowed here — skip-flow context).
         try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
@@ -3752,16 +3805,19 @@
         // Always click the element first so page event handlers,
         // AJAX token fetches, form submissions, and analytics/session updates run naturally!
         console.log('[KillURL] Clicking CTA element:', (el.textContent || el.value || el.id || el.className || 'button').trim().slice(0, 60));
-        unloading = true;
         suppressAutoPressUntil = Date.now() + 15000;
         const navFrom = window.location.href;
-        setTimeout(() => {
-            try {
-                if (window.location.href === navFrom) unloading = false;
-            } catch (e) { unloading = false; }
-        }, 8000);
 
-        dispatchFullClickSequence(el);
+        // Dispatch full human click sequence FIRST (unloading must not be true during the click!)
+        const clicked = dispatchFullClickSequence(el);
+        if (clicked) {
+            unloading = true;
+            setTimeout(() => {
+                try {
+                    if (window.location.href === navFrom) unloading = false;
+                } catch (e) { unloading = false; }
+            }, 8000);
+        }
 
         // If clicking did not trigger navigation after a settle window,
         // and el is a genuine external link (not javascript/hash), navigate as fallback
