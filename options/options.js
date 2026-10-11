@@ -20,8 +20,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const saveBtn = document.getElementById('saveBtn');
     const resetBtn = document.getElementById('resetBtn');
 
-    // Known shortener domains (from background)
-    const SHORTENER_DOMAINS = [
+    // Known shortener domains (from shared/sites.js)
+    const SHORTENER_DOMAINS = window.KILLURL_SITES?.SHORTENERS || [
         'bit.ly', 'bitly.com', 'tinyurl.com', 'goo.gl', 't.co',
         'ow.ly', 'is.gd', 'buff.ly', 'adf.ly', 'j.mp',
         'dlvr.it', 'ift.tt', 'db.tt',
@@ -54,6 +54,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         'xpshort.com',
         'iir.ai',
         'reqlinks.net',
+        'vplink.in',
         'clicksfly.com',
         'fc-lc.com', 'fc.lc',
         'earnhub.net',
@@ -190,6 +191,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         loadSettings();
         saveBar.classList.remove('visible');
     });
+
+    // Reset server-timer bypass cache
+    const clearPatientBtn = document.getElementById('clearPatientBtn');
+    if (clearPatientBtn) {
+        clearPatientBtn.addEventListener('click', async () => {
+            try {
+                await chrome.runtime.sendMessage({ type: 'RESET_LEARNED_PATIENT' });
+                clearPatientBtn.textContent = '✓ Reset!';
+                setTimeout(() => { clearPatientBtn.textContent = 'Reset bypass cache'; }, 1500);
+            } catch (e) { /* ignore */ }
+        });
+    }
 
     // ===== INIT =====
     await loadSettings();

@@ -136,6 +136,24 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
 
+    // Check protected/final site directly via KILLURL_SITES
+    const sites = window.KILLURL_SITES || null;
+    const tabHost = sites && tab?.url ? sites.hostOfUrl(tab.url) : '';
+    if (sites && tabHost) {
+        if (sites.isProtected(tabHost)) {
+            setStatus('safe', '🛡️ Protected Site', 'KillURL is dormant on ' + tabHost);
+            skipBtn.disabled = true;
+            redirectBtn.disabled = true;
+            return;
+        }
+        if (sites.isFinal(tabHost)) {
+            setStatus('safe', '🎉 Destination Reached', tabHost + ' — final file destination');
+            skipBtn.disabled = true;
+            redirectBtn.disabled = true;
+            return;
+        }
+    }
+
     // Get page status from content script
     requestPageStatus();
 
@@ -152,7 +170,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
             const response = await chrome.tabs.sendMessage(currentTabId, { type: 'DO_SKIP' });
 
-            if (response?.isSecurityPage) {
+            if (response?.isProtected) {
+                btnTitle.textContent = 'Protected';
+                showToast('🛡️ Protected site — KillURL is dormant', 'error');
+                setStatus('safe', '🛡️ Protected Site', 'KillURL does not run on major sites');
+                skipBtn.disabled = true;
+            } else if (response?.isFinal) {
+                btnTitle.textContent = 'Destination';
+                showToast('🎉 Already at final destination', 'success');
+                setStatus('safe', '🎉 Destination Reached', 'Final destination reached');
+                skipBtn.disabled = true;
+            } else if (response?.isSecurityPage) {
                 btnTitle.textContent = 'Blocked';
                 showToast('🛡️ Security page — skip disabled to avoid breaking captcha', 'error');
                 setStatus('safe', '🛡️ Security Page', 'Cloudflare/captcha detected');
@@ -269,10 +297,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             const response = await chrome.tabs.sendMessage(currentTabId, { type: 'REMOVE_ADBLOCK_WALL' });
             if (response?.removed > 0) {
                 btnTitle.textContent = `Removed ${response.removed}!`;
-                showToast(`Removed ${response.removed} ad-block wall(s)!`, 'success');
+                showToast(`Removed ${response.removed} blocker(s)!`, 'success');
             } else {
                 btnTitle.textContent = 'None Found';
-                showToast('No ad-block walls detected on this page', 'success');
+                showToast('No blockers found on this page', 'success');
             }
         } catch (e) {
             btnTitle.textContent = 'Error';
@@ -408,12 +436,34 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        // Arrival: this page IS the destination the chain led to. Celebrate,
-        // don't skip — auto-action is stood down here (manual Skip still works).
-        if (response.arrived) {
-            setStatus('safe', '🎉 Destination reached', response.hostname || 'You made it to the final page');
-            skipBtn.disabled = false; // manual override stays available
+        // Protected site
+        if (response.isProtected) {
+            setStatus('safe', '🛡️ Protected Site', 'KillURL is dormant on ' + (response.hostname || 'this site'));
+            skipBtn.disabled = true;
             redirectBtn.disabled = true;
+            return;
+        }
+
+        // Arrival: this page IS the destination the chain led to. Celebrate,
+        // don't skip — auto-action is stood down here.
+        if (response.isFinal || response.arrived) {
+            setStatus('safe', '🎉 Destination reached', response.hostname || 'You made it to the final page');
+            skipBtn.disabled = true;
+            redirectBtn.disabled = true;
+            return;
+        }
+
+        // Server-enforced wait: client timers accelerated and tokens spoofed
+        if (response.patient) {
+            const gateTxt = (typeof response.gateInSec === 'number' && response.gateInSec > 0)
+                ? ' — bypassing in ~' + response.gateInSec + 's'
+                : ' — actively bypassing';
+            setStatus('scanning', '⚡ Server-Timer Bypass', 'Fast token spoofing & timer drive' + gateTxt);
+            skipBtn.disabled = false;
+            redirectBtn.disabled = !response.destinationUrl;
+            if (response.destinationUrl) {
+                showDestination(response.destinationUrl);
+            }
             return;
         }
 

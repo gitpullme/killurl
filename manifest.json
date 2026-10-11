@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "KillURL - URL Shortener Bypass",
-    "version": "1.2.4",
+    "version": "1.4.2",
     "description": "Skip countdown timers and bypass URL shortener pages instantly. Get the final destination URL with one click.",
     "browser_specific_settings": {
         "gecko": {
@@ -46,17 +46,20 @@
                 "<all_urls>"
             ],
             "js": [
+                "shared/sites.js",
                 "content/content.js"
             ],
             "css": [
                 "content/content.css"
             ],
-            "run_at": "document_start"
+            "run_at": "document_start",
+            "all_frames": true
         }
     ],
     "web_accessible_resources": [
         {
             "resources": [
+                "shared/sites.js",
                 "content/injector.js",
                 "icons/*"
             ],

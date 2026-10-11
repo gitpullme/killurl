@@ -16,12 +16,74 @@
     let isShortenerPage = false;
     let isKnownShortener = false; // Confirmed via background domain list
     let isSecurityPage = false; // Cloudflare/captcha detected
+    let isProtectedSite = false; // Discord, Google, etc.
+    let isFinalSite = false; // Mediafire, Mega, Google Drive, etc.
     let destinationUrl = null;
     let countdownDetected = false;
     let settings = { enabled: true };
     let settingsLoaded = false; // true once GET_SETTINGS resolved in this context
     let userArmed = false; // true once the user explicitly hit Skip on THIS page
     let arrivedAtDestination = false; // true when this page IS the found destination
+    // Patient mode: this HOST enforces step timing server-side (proven by a
+    // bounce, or seeded/learned). NO timer driving, NO clock shift, NO var
+    // freezing — those tricks get the token rejected. But we do NOT wait
+    // blindly either: we hold only the single gate-crossing action until the
+    // earliest instant the server must accept (learned seconds, or the page's
+    // own advertised countdown + margin, or observed natural completion —
+    // whichever proves legal first). The wait costs the user zero attention.
+    let patientMode = false;
+    let enforcedRequired = null; // learned required seconds for this host (from background)
+    let stepT0 = 0; // when this step page loaded (real, unshifted time)
+    let advertisedWait = null; // max countdown seconds this page advertises
+    let sawCountdownMove = false; // the visible count actually ticked at least once
+    let hostVisitCount = 1; // same-host loads in this tab (diagnostic only now)
+    // Self-experiment state for this page/host. The engine doesn't assume HOW
+    // a host validates — it tries fast, then deadline, then (on repeat bounces
+    // with a malleable token) ONE backdated submit, and remembers the verdict.
+    let hostMalleable = false; // aged tokens pass here → submit instantly
+    let hostStrict = false; // aged tokens bounced here → deadline only, no probes
+    let hostBounces = 0; // bounces observed on this host (from background)
+    let pageTokens = null; // inspector result for THIS page (null = not scanned yet)
+    let probeTried = false; // a backdated probe already fired on this page
+    let pendingTimeRewrite = null; // {targetMs, ttlMs} re-sent until the injector acks via handshake
+
+    function enterPatientMode(source, required) {
+        if (typeof required === 'number' && required > 0) {
+            enforcedRequired = Math.min(Math.max(enforcedRequired || 0, required), 3); // Max 3s floor
+        }
+        if (patientMode) return;
+        patientMode = true;
+        console.log(`[KillURL] Server-side timer bypass mode (${source}) — accelerating timers`);
+        try {
+            window.dispatchEvent(new CustomEvent('killurl-patient'));
+        } catch (e) { /* ignore */ }
+    }
+
+    // DEADLINE GATE: in server-timer bypass mode, client timers fast-forward and
+    // form/net tokens are backdated, so the gate opens within at most ~2s (for initial DOM init).
+    function gateReady() {
+        if (!patientMode) {
+            // Even when not in patient mode, do not declare ready if countdown is actively ticking
+            if (countdownIsLive()) return false;
+            return true;
+        }
+        if (hostMalleable && pageTokens && pageTokens.malleableCount > 0 && !countdownIsLive()) return true;
+        const elapsedMs = Date.now() - stepT0;
+        if (elapsedMs >= 2000 && !countdownIsLive()) return true;
+        const observedEnd = sawCountdownMove && !countdownIsLive();
+        if (observedEnd || !countdownIsLive()) return true;
+        return false;
+    }
+
+    function gateRemainingMs() {
+        try {
+            if (!patientMode) return 0;
+            if (hostMalleable && pageTokens && pageTokens.malleableCount > 0 && !countdownIsLive()) return 0;
+            const elapsedMs = Date.now() - stepT0;
+            if ((elapsedMs >= 2000 || (sawCountdownMove && !countdownIsLive())) && !countdownIsLive()) return 0;
+            return Math.max(0, 2000 - elapsedMs);
+        } catch (e) { return 0; }
+    }
     // Smoking gun: PROOF of a real countdown (explicit wait-timer text, a digit
     // countdown element, a prominent number/clock, or a meta refresh). Weak
     // chatter ("verify", "timer", wizard steps) never sets this. Auto-action on
@@ -38,32 +100,42 @@
     // event (or the fallback timer) can't double-run or cross steps.
     let skipSequence = 0;
     let lastTicksDoneToken = 0;
+    let skipRetriesScheduled = false;
     function ticksDoneSeenFor(token) {
         return lastTicksDoneToken >= token;
     }
 
     function postDriveClickWave(source) {
         if (!isEnabled()) return;
+        if (isProtectedSite || isFinalSite) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
+        if (isCaptchaPending()) {
+            console.log(`[KillURL] Post-drive click wave withheld: Captcha / Turnstile is pending`);
+            return;
+        }
         console.log(`[KillURL] Post-drive click wave (${source})`);
         revealHiddenElements();
         removeOverlays();
         handleProgressBars();
         forceEnableButtons();
-        forceCountdownTextToZero();
-        clickContinueButton();
-        submitTokenFormIfReady();
-        findDestinationUrl();
-        // One more wave in case the completion handler renders async
+        // Give short settle delay (250ms) for page's timer completion callbacks / AJAX token fetches to run
         setTimeout(() => {
             if (!isEnabled()) return;
-            if (destinationUrl) return;
+            if (destinationUrl || isCaptchaPending()) return;
+            clickContinueButton();
+            submitTokenFormIfReady();
+            findDestinationUrl();
+        }, 250);
+        // Secondary wave in case the completion handler renders async
+        setTimeout(() => {
+            if (!isEnabled()) return;
+            if (destinationUrl || isCaptchaPending()) return;
             revealHiddenElements();
             forceEnableButtons();
             clickContinueButton();
             submitTokenFormIfReady();
             findDestinationUrl();
-        }, 1200);
+        }, 900);
     }
 
     function isEnabled() {
@@ -86,70 +158,189 @@
             window.dispatchEvent(new CustomEvent('killurl-set-stealth', {
                 detail: { enabled: settings.adblockStealth !== false }
             }));
+            // Patient state rides along on every broadcast: whichever moment
+            // the injector actually loads, its FIRST state message already
+            // tells it to stand down — no fast-activation window can open.
+            // Proven-malleable hosts are EXCLUDED: aged tokens make elapsed
+            // time irrelevant there, so the injector must stay armed for the
+            // drive. A dedicated killurl-malleable event lifts even a
+            // seed-booted stand-down (ordering-proof either way).
+            if (patientMode && !hostMalleable) {
+                window.dispatchEvent(new CustomEvent('killurl-patient'));
+            }
+            if (hostMalleable) {
+                try {
+                    window.dispatchEvent(new CustomEvent('killurl-malleable'));
+                } catch (e) { /* ignore */ }
+            }
+            // Pending fetch/XHR time-rewrite arm (malleable hosts / probes).
+            // Re-dispatched on every broadcast so late injector loads still
+            // get it; the injector enforces its own TTL.
+            if (pendingTimeRewrite) {
+                try {
+                    window.dispatchEvent(new CustomEvent('killurl-arm-time-rewrite', {
+                        detail: pendingTimeRewrite
+                    }));
+                } catch (e) { /* ignore */ }
+            }
         } catch (e) { /* ignore */ }
     }
 
-    // ===== SECURITY PAGE DETECTION =====
-    // These pages must NEVER be interfered with
+    // ===== SECURITY PAGE & CAPTCHA DETECTION =====
+    // These pages must NEVER be interfered with (interstitial blocking challenges)
 
-    function checkSecurityPage() {
-        const url = window.location.href.toLowerCase();
-        const hostname = window.location.hostname.toLowerCase();
+    const CAPTCHA_SHORTENER_DOMAINS = [
+        'vplink.in', 'vplinks.in'
+    ];
 
-        // Cloudflare domains
-        if (hostname.includes('challenges.cloudflare.com')) return true;
-        if (url.includes('/cdn-cgi/') && url.includes('challenge')) return true;
-
-        // Captcha domains
-        if (hostname.includes('google.com') && url.includes('recaptcha')) return true;
-        if (hostname.includes('recaptcha.net')) return true;
-        if (hostname.includes('hcaptcha.com')) return true;
-
-        return false;
+    function isCaptchaShortenerDomain(h) {
+        h = (h || window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+        if (typeof sites !== 'undefined' && sites && typeof sites.isCaptchaShortener === 'function') {
+            return sites.isCaptchaShortener(h);
+        }
+        return CAPTCHA_SHORTENER_DOMAINS.some(d => h === d || h.endsWith('.' + d));
     }
 
-    function checkSecurityPageDOM() {
+    function isInterstitialSecurityPage() {
         try {
-            const html = document.documentElement?.innerHTML || '';
+            const url = (window.location.href || '').toLowerCase();
+            const hostname = (window.location.hostname || '').toLowerCase();
 
-            // Cloudflare challenge HTML markers (very specific element IDs/classes)
-            if (html.includes('id="cf-challenge-running"') ||
-                html.includes('id="challenge-running"') ||
-                html.includes('cf-turnstile-wrapper') ||
-                html.includes('id="challenge-form"') ||
-                html.includes('id="challenge-stage"') ||
-                html.includes('cf-chl-widget')) {
+            // Cloudflare challenge domain / platform URLs
+            if (hostname === 'challenges.cloudflare.com') return true;
+            if (url.includes('/cdn-cgi/challenge-platform/')) return true;
+            if (url.includes('cf_chl_') || url.includes('__cf_chl_')) return true;
+
+            // Full-page blocking challenge elements
+            if (document.querySelector('#cf-challenge-running, #challenge-running, #challenge-stage')) {
                 return true;
             }
 
-            // Cloudflare JS challenge scripts
-            if (html.includes('/cdn-cgi/challenge-platform/')) {
+            const html = document.documentElement?.innerHTML || '';
+            if (html.includes('id="cf-challenge-running"') ||
+                html.includes('id="challenge-running"') ||
+                html.includes('id="challenge-stage"') ||
+                html.includes('/cdn-cgi/challenge-platform/')) {
                 return true;
             }
 
             const bodyText = document.body?.textContent || '';
-
-            // Very specific Cloudflare verification text (require BOTH text + CF HTML markers)
-            if (bodyText.includes('Performing security verification') &&
-                bodyText.includes('security service') && html.includes('cf-')) {
-                return true;
-            }
-            if (bodyText.includes('DDoS protection by') && bodyText.includes('Cloudflare')) {
-                return true;
-            }
-            if (bodyText.includes('Just a moment...') && html.includes('cf-challenge')) {
-                return true;
-            }
-
+            if (bodyText.includes('Performing security verification') && html.includes('cf-')) return true;
+            if (bodyText.includes('Checking if the site connection is secure') && html.includes('cf-')) return true;
+            if (bodyText.includes('DDoS protection by') && bodyText.includes('Cloudflare')) return true;
+            if (bodyText.includes('Just a moment...') && (html.includes('cf-challenge') || html.includes('cloudflare'))) return true;
         } catch (e) { /* ignore */ }
         return false;
+    }
+
+    function hasCaptchaOrTurnstile() {
+        try {
+            if (isCaptchaShortenerDomain()) return true;
+            if (document.querySelector(
+                '.cf-turnstile, [name="cf-turnstile-response"], [data-sitekey], ' +
+                'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[src*="turnstile"], ' +
+                'script[src*="challenges.cloudflare.com"], script[src*="turnstile"], script[src*="challenge-platform"], ' +
+                '.g-recaptcha, [name="g-recaptcha-response"], iframe[src*="recaptcha"], script[src*="recaptcha"], ' +
+                '.h-captcha, [name="h-captcha-response"], iframe[src*="hcaptcha"], script[src*="hcaptcha"], ' +
+                '.cf-turnstile-wrapper, .cf-chl-widget'
+            )) {
+                return true;
+            }
+            const html = document.documentElement?.innerHTML || '';
+            if (html.includes('challenges.cloudflare.com') || html.includes('turnstile/v0/api.js') || html.includes('cf-turnstile')) {
+                return true;
+            }
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    function checkSecurityPage() {
+        return isInterstitialSecurityPage();
+    }
+
+    function checkSecurityPageDOM() {
+        return isInterstitialSecurityPage();
+    }
+
+    // Check if a captcha or Turnstile is actively pending/unsolved on this page
+    function isCaptchaPending() {
+        try {
+            // 1. Cloudflare Turnstile
+            const turnstileEl = document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+            const turnstileInput = document.querySelector('[name="cf-turnstile-response"]');
+            if (turnstileEl || turnstileInput) {
+                if (turnstileInput) {
+                    const token = (turnstileInput.value || '').trim();
+                    if (!token || token.length < 10) return true; // Unsolved or pending
+                } else {
+                    return true; // Widget exists but response input not yet generated
+                }
+            }
+
+            // 2. Google reCAPTCHA
+            const recaptchaEl = document.querySelector('.g-recaptcha, iframe[src*="recaptcha"]');
+            const recaptchaInput = document.querySelector('[name="g-recaptcha-response"]');
+            if (recaptchaEl || recaptchaInput) {
+                if (recaptchaInput) {
+                    const token = (recaptchaInput.value || '').trim();
+                    if (!token || token.length < 10) return true;
+                } else {
+                    return true;
+                }
+            }
+
+            // 3. hCaptcha
+            const hcaptchaEl = document.querySelector('.h-captcha, iframe[src*="hcaptcha"]');
+            const hcaptchaInput = document.querySelector('[name="h-captcha-response"]');
+            if (hcaptchaEl || hcaptchaInput) {
+                if (hcaptchaInput) {
+                    const token = (hcaptchaInput.value || '').trim();
+                    if (!token || token.length < 10) return true;
+                } else {
+                    return true;
+                }
+            }
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    function hasSolvedCaptchaToken() {
+        try {
+            const turnstileInput = document.querySelector('[name="cf-turnstile-response"]');
+            if (turnstileInput && (turnstileInput.value || '').trim().length >= 10) return true;
+            const recaptchaInput = document.querySelector('[name="g-recaptcha-response"]');
+            if (recaptchaInput && (recaptchaInput.value || '').trim().length >= 10) return true;
+            const hcaptchaInput = document.querySelector('[name="h-captcha-response"]');
+            if (hcaptchaInput && (hcaptchaInput.value || '').trim().length >= 10) return true;
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    let lastCaptchaPending = false;
+    let captchaGateOpened = false;
+    function checkCaptchaResolution() {
+        const pending = isCaptchaPending();
+        const hasToken = hasSolvedCaptchaToken();
+        if ((lastCaptchaPending && !pending) || (hasToken && !captchaGateOpened)) {
+            captchaGateOpened = true;
+            console.log('[KillURL] Captcha / Turnstile verified successfully! Gate opened.');
+            isSecurityPage = false;
+            setTimeout(() => {
+                if (!isEnabled()) return;
+                if (destinationUrl) return;
+                clickContinueButton();
+                submitTokenFormIfReady();
+                findDestinationUrl();
+            }, 600);
+        }
+        lastCaptchaPending = pending;
     }
 
     // ===== TEXT PATTERNS (for DETECTION only, not auto-action) =====
 
     const COUNTDOWN_TEXT_PATTERNS = [
         /please wait\s*\d*/i,
-        /wait\s*\d+\s*second/i,
+        /\bwait\s*\d+\s*second/i,
         /\d+\s*seconds?\s*remaining/i,
         /\d+\s*seconds?\s*left/i,
         /generating\s*(your\s*)?link/i,
@@ -169,7 +360,7 @@
         /you\s*will\s*be\s*redirected/i,
         /redirecting\s*in/i,
         /skip\s*(this\s*)?ad/i,
-        /wait\s*for\s*\d+/i,
+        /\bwait\s*for\s*\d+/i,
         /timer/i,
         /countdown/i,
         // ---- generic / multilingual (v2 smart engine) ----
@@ -180,7 +371,7 @@
         /unlock\s*(your\s*)?(link|download|content|button)/i,
         /your\s*link\s*(is\s*)?almost\s*ready/i,
         /link\s*(will\s*appear|appears)\s*(in|after)/i,
-        /wait\s*a\s*moment/i,
+        /\bwait\s*a\s*moment/i,
         /please\s*stay\s*(on\s*this\s*page|here)/i,
         /do\s*not\s*close\s*(this\s*)?(tab|window|page)/i,
         /press\s*continue/i,
@@ -210,8 +401,6 @@
         /^proceed$/i,
         /^click\s*here$/i,
         /^click\s*here\s*to\s*continue$/i,
-        /^download$/i,
-        /^download\s*now$/i,
         /^download\s*link$/i,
         /^go\s*to\s*link$/i,
         /^visit\s*(link|page|site|url)$/i,
@@ -219,8 +408,6 @@
         /^generate\s*(download\s*)?link$/i,
         /^access\s*link$/i,
         /^open\s*link$/i,
-        /^free\s*download$/i,
-        /^direct\s*download$/i,
         /scroll\s*down\s*to\s*continue/i,
         /continue\s*to\s*/i,
         /go\s*to\s*destination/i,
@@ -265,7 +452,7 @@
     // page itself advertises), unlike bare "verify"/"unlock"/"step" wording.
     const STRONG_TIMER_PATTERNS = [
         /please\s*wait/i,
-        /wait\s+\d+/i,
+        /\bwait\s+\d+/i,
         /\d+\s*seconds?\s*(remaining|left|to\s*(go|wait))/i,
         /redirecting\s*in/i,
         /(continue|proceed).{0,12}in\s*\d+/i,
@@ -315,8 +502,6 @@
         'a[href*="?r="]', 'a[href*="?redirect="]', 'a[href*="?out="]',
         'a[href*="/go/"]', 'a[href*="/out/"]', 'a[href*="/redirect/"]',
         'a[href*="/link/"]', 'a[href*="/get/"]',
-        'a#downloadButton', 'a.downloadButton', 'a#download-btn',
-        'a.download-btn', 'a.download-link', 'a#download-link',
         'a.btn-success', 'a.btn-primary', 'a.btn-info',
         'button#continue', 'button.continue',
         'button#skip', 'button.skip',
@@ -324,7 +509,6 @@
         '#btn-main a', '.btn-main a',
         '#wpsafe-link a', '.wpsafe-link a',
         '#wpsafe-generate a',
-        '#download a', '.download a',
         '#link-box a', '.link-box a',
         '#final-link a', '.final-link a',
         // earnbox.in specific selectors
@@ -351,7 +535,6 @@
         '#skip', '.skip', '#continue', '.continue',
         '#go-link', '.go-link', '#getlink', '.getlink',
         '#btn-main', '.btn-main',
-        '#download', '.download',
         '#land-btn', '.land-btn',
         '#wpsafe-link', '.wpsafe-link',
         '#wpsafe-generate', '.wpsafe-generate',
@@ -372,8 +555,16 @@
 
     function ensureInjectorLoaded() {
         try {
+            if (isCaptchaShortenerDomain()) {
+                console.log('[KillURL] Captcha shortener domain (' + window.location.hostname + ') — omitting injector.js to preserve Turnstile verification');
+                return;
+            }
+            if (isSecurityPage || isInterstitialSecurityPage() || hasCaptchaOrTurnstile()) {
+                console.log('[KillURL] Security / Captcha page detected — skipping injector.js insertion');
+                return;
+            }
             const pageWindow = typeof window.wrappedJSObject !== 'undefined' ? window.wrappedJSObject : window;
-            if (!pageWindow.__killurl_injector_loaded) {
+            if (!pageWindow.__k7_ld) {
                 const api = typeof browser !== 'undefined' && browser.runtime ? browser : chrome;
                 const script = document.createElement('script');
                 script.src = api.runtime.getURL('content/injector.js');
@@ -389,7 +580,12 @@
     }
 
     async function init() {
-        ensureInjectorLoaded();
+        try {
+            const mv = chrome.runtime.getManifest?.().version || '?';
+            console.log('[KillURL] content boot v' + mv + ' @ ' + window.location.hostname);
+        } catch (e) { /* ignore */ }
+        const sites = window.KILLURL_SITES || (typeof globalThis !== 'undefined' ? globalThis.KILLURL_SITES : null);
+        const hostname = window.location.hostname.replace(/^www\./, '').toLowerCase();
 
         try {
             settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
@@ -400,12 +596,16 @@
         if (typeof settings.enabled === 'undefined') settings.enabled = true;
         settingsLoaded = true;
 
-        // Tell MAIN world injector the master state ASAP (even when disabled,
-        // so it can undo its document_start auto-activation)
-        broadcastStatesToInjector();
-        if (settings.screenShareDRM) {
-            console.log('[KillURL] DRM screen share bypass setting sent to MAIN world: ENABLED');
-        }
+        // Effective-state heartbeat: the two most common "nothing happens"
+        // causes are a master switch left OFF and autoSkip left OFF — both
+        // are answered by this single line, no guessing needed.
+        try {
+            console.log('[KillURL] state: enabled=' + (settings.enabled !== false) +
+                ' autoSkip=' + !!settings.autoSkip +
+                ' aggressive=' + !!settings.aggressiveMode +
+                ' adWalls=' + !!settings.removeAdBlockWalls +
+                ' stealth=' + (settings.adblockStealth !== false));
+        } catch (e) { /* ignore */ }
 
         // Master switch OFF → stay completely dormant
         if (settings.enabled === false) {
@@ -413,12 +613,93 @@
             return;
         }
 
-        // Arrival check: did the previous step send us here as the DESTINATION?
-        // If so this is the page the user actually wanted — stand down all
-        // auto-action (no clicks, submits, or jumps) so we can't bounce them
-        // back into the shortener loop. Manual Skip still works (userArmed).
-        // Sticky per page-load: the background entry is one-shot, so a later
-        // re-init (e.g. OFF→ON toggle) must not lose the arrival state.
+        // Iframe context (ad frames etc.): dormant except the ritual-X
+        // watcher. Nothing inside a frame is ever auto-clicked, submitted,
+        // revealed or navigated — but a click-ads modal rendered in a frame
+        // still gets its X pressed.
+        let inIframe = false;
+        try { inIframe = window.self !== window.top; } catch (e) { inIframe = true; }
+        if (inIframe) {
+            console.log('[KillURL] Iframe context — ritual-X watcher only');
+            try { watchRitualModals(); } catch (e) { /* ignore */ }
+            try { dismissInstructionModals({ aggressive: false, xOnly: true }); } catch (e) { /* ignore */ }
+            try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+            if (settings.removeAdBlockWalls) {
+                try { watchAdBlockWalls({ iframe: true }); } catch (e) { /* ignore */ }
+            }
+            return;
+        }
+
+        // 1. Protected domain check (Discord, Google, etc. — NEVER disrupt)
+        if (sites && sites.isProtected(hostname)) {
+            isProtectedSite = true;
+            // Streaming site exception: ONLY allow DRM bypass if user turned it on
+            if (sites.isStreaming(hostname) && settings.screenShareDRM) {
+                console.log('[KillURL] Streaming site on protected domain with DRM bypass active:', hostname);
+                ensureInjectorLoaded();
+                broadcastStatesToInjector();
+                return;
+            }
+            console.log('[KillURL] Protected domain — KillURL is dormant on', hostname);
+            return;
+        }
+
+        // 2. Final destination check (Mediafire, Mega, Google Drive, etc. — NEVER skip)
+        if (sites && sites.isFinal(hostname)) {
+            if (!sites.isErrorUrl(window.location.href)) {
+                isFinalSite = true;
+                arrivedAtDestination = true;
+                console.log('[KillURL] Final destination reached (' + hostname + ') — standing down completely');
+                try {
+                    chrome.runtime.sendMessage({ type: 'CHAIN_COMPLETED', url: window.location.href });
+                } catch (e) { /* ignore */ }
+                return;
+            } else {
+                console.log('[KillURL] Error page detected on destination host (' + window.location.href + ') — not marking completed');
+            }
+        }
+
+        // 3. Site scope check ('known', 'custom', 'all')
+        if (settings.enabledSites === 'known') {
+            const isKnown = sites ? sites.isShortener(hostname) : false;
+            const customList = sites ? sites.normCustom(settings.customSites) : [];
+            const isCustom = sites ? sites.inList(hostname, customList) : false;
+            if (!isKnown && !isCustom) {
+                console.log('[KillURL] Site not in known shorteners scope — dormant:', hostname);
+                return;
+            }
+        } else if (settings.enabledSites === 'custom') {
+            const customList = sites ? sites.normCustom(settings.customSites) : [];
+            const isCustom = sites ? sites.inList(hostname, customList) : false;
+            if (!isCustom) {
+                console.log('[KillURL] Site not in custom sites list — dormant:', hostname);
+                return;
+            }
+        }
+
+        // Standalone ritual-modal watcher: independent of skip flows, autopilot
+        // and waiter, so instruction modals get their X pressed whenever they
+        // appear — even on pages where no skip ever engages. X-press only.
+        // Watch-ad gates get their own Continue pressed the same way.
+        try { watchRitualModals(); } catch (e) { /* ignore */ }
+        try { dismissInstructionModals({ aggressive: false, xOnly: true }); } catch (e) { /* ignore */ }
+        try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+        // Always-on wall remover (the Auto-Remove toggle): sweeps all three
+        // wall species on every DOM change instead of 4 fixed timeouts.
+        if (settings.removeAdBlockWalls) {
+            try { watchAdBlockWalls(); } catch (e) { /* ignore */ }
+        }
+
+        // 4. Seed patient mode immediately if known server-side timing check host (e.g. vplink.in)
+        if (sites && sites.inList(hostname, sites.PATIENT_SEED)) {
+            enterPatientMode('seed');
+        }
+
+        // 5. Arrival + loop checks FIRST. The injector must never receive its
+        // "master ON" (which fast-activates it on known shortener domains)
+        // before we know whether this chain is patient — that ordering race
+        // used to fast-forward timers for a moment right after a bounce and
+        // defeated loop protection entirely.
         if (!arrivedAtDestination) {
             try {
                 const arr = await chrome.runtime.sendMessage({ type: 'CHECK_ARRIVED', url: window.location.href });
@@ -438,21 +719,74 @@
             return;
         }
 
-        // Early security check (URL-based, before DOM is ready)
-        if (checkSecurityPage()) {
+        // Loop check: been here before in this tab, or has this HOST proven
+        // server-side waits (seeded or learned, with required seconds)?
+        // Patient BEFORE the injector loads so it can never fast-activate.
+        // stepT0 marks real step arrival for the deadline gate.
+        stepT0 = Date.now();
+        try {
+            const lp = await chrome.runtime.sendMessage({ type: 'CHECK_LOOP', url: window.location.href });
+            if (typeof lp?.hostVisits === 'number') hostVisitCount = lp.hostVisits;
+            if (typeof lp?.bounces === 'number') hostBounces = lp.bounces;
+            if (lp?.strict) hostStrict = true;
+            if (lp?.loop) {
+                enterPatientMode(lp?.learned ? 'learned server-timed host' : 'revisit #' + (lp.visits || '?'), lp?.required);
+            }
+            if (lp?.malleable) {
+                hostMalleable = true;
+                pendingTimeRewrite = null;
+                console.log('[KillURL] Host malleable — fast server skip engine active');
+            }
+            // Passive token scan shortly after load (powers the probe path).
+            setTimeout(() => { try { inspectTokens(); } catch (e) { /* ignore */ } }, 2000);
+        } catch (e) { /* background unreachable: proceed normally */ }
+
+        // Security check: interstitial challenge vs captcha widget
+        if (isInterstitialSecurityPage()) {
             isSecurityPage = true;
-            console.log('[KillURL] Security page detected');
+            console.log('[KillURL] Interstitial security challenge page detected — standing down');
+            return;
         }
 
-        // If security page detected early and aggressive mode is OFF, bail out
-        if (isSecurityPage && !settings.aggressiveMode) {
-            console.log('[KillURL] Security page — all actions disabled (aggressive mode off)');
-            return;
+        if (isCaptchaShortenerDomain() || hasCaptchaOrTurnstile()) {
+            console.log('[KillURL] Captcha shortener / widget present — omitting injector.js to preserve Turnstile integrity');
+        } else {
+            // 6. Only now inject the MAIN-world injector — its first state
+            // broadcast already carries patient/arrival information.
+            ensureInjectorLoaded();
+            broadcastStatesToInjector();
+        }
+        if (settings.screenShareDRM) {
+            console.log('[KillURL] DRM screen share bypass setting sent to MAIN world: ENABLED');
         }
 
         // Listen for events from MAIN world injector (attach once)
         if (!mainListenersAttached) {
             mainListenersAttached = true;
+
+            // Global click capture in content script: prevent ad clicks and enforce _self on links
+            try {
+                document.addEventListener('click', (e) => {
+                    if (!isEnabled()) return;
+                    try {
+                        const a = e.target?.closest?.('a[href]');
+                        if (a) {
+                            const href = (a.href || a.getAttribute('href') || '').trim();
+                            if (href && isAdUrl(href)) {
+                                console.log('[KillURL] Blocked click on ad link in content script:', href.slice(0, 80));
+                                e.preventDefault();
+                                e.stopPropagation();
+                                return;
+                            }
+                            if (isNewTabTarget(a.target) || isNewTabTarget(a.getAttribute('target'))) {
+                                a.target = '_self';
+                                a.setAttribute('target', '_self');
+                            }
+                        }
+                    } catch (err) { /* ignore */ }
+                }, true);
+            } catch (e) { /* ignore */ }
+
             window.addEventListener('killurl-timer-intercepted', (e) => {
                 if (!isEnabled()) return;
                 console.log('[KillURL] Timer intercepted by injector:', e.detail);
@@ -534,6 +868,10 @@
 
         // Turned back ON — (re)start detection
         console.log('[KillURL] Turned ON — (re)starting detection');
+        if (isProtectedSite || isFinalSite) {
+            console.log('[KillURL] Turned ON, but site is protected or final destination — staying dormant');
+            return;
+        }
         isSecurityPage = checkSecurityPage() || checkSecurityPageDOM();
         if (isSecurityPage && !settings.aggressiveMode) return;
         skipAttempted = false;
@@ -553,14 +891,21 @@
 
     function onDOMReady() {
         if (!isEnabled()) return;
-        // Check security page via DOM markers
-        if (checkSecurityPageDOM()) {
+        // Check security page (interstitial challenge)
+        if (isInterstitialSecurityPage()) {
             isSecurityPage = true;
             if (!settings.aggressiveMode) {
-                console.log('[KillURL] Security page (DOM) detected — all actions disabled');
+                console.log('[KillURL] Interstitial security page detected — all actions disabled');
                 return;
             }
-            console.log('[KillURL] Security page (DOM) detected — aggressive mode, continuing...');
+            console.log('[KillURL] Interstitial security page detected — aggressive mode, continuing...');
+        }
+
+        if (hasCaptchaOrTurnstile() || isCaptchaShortenerDomain()) {
+            console.log('[KillURL] Turnstile / Captcha detected on DOM ready — main world kept native');
+            try {
+                window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'dom-ready-turnstile' } }));
+            } catch (e) { /* ignore */ }
         }
 
         // DETECTION only — no skipping
@@ -587,12 +932,17 @@
             setTimeout(() => {
                 if (isSecurityPage && !settings.aggressiveMode) return;
                 // Re-check for security (some pages load CF challenge after a moment)
-                if (checkSecurityPageDOM()) {
+                if (isInterstitialSecurityPage()) {
                     isSecurityPage = true;
                     if (!settings.aggressiveMode) {
                         stopContinuousScanner();
                         return;
                     }
+                }
+                if (hasCaptchaOrTurnstile()) {
+                    try {
+                        window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'interval-turnstile' } }));
+                    } catch (e) { /* ignore */ }
                 }
                 detectShortenerPage();
                 passiveScan();
@@ -652,7 +1002,9 @@
         if (continuousScanner) return;
 
         continuousScanner = setInterval(() => {
+            checkCaptchaResolution();
             if (isSecurityPage && !settings.aggressiveMode) {
+                if (isCaptchaPending()) return;
                 stopContinuousScanner();
                 return;
             }
@@ -699,6 +1051,23 @@
                 console.log(`[KillURL] Countdown detected by strong text: ${pattern}`);
                 countdownDetected = true;
                 countdownGunSeen = true;
+                // Capture the advertised wait: the largest wait-bound number in
+                // this page's text. This feeds the deadline floor (advertised+2)
+                // and the bounce attribution sent to the background.
+                try {
+                    const nums = [];
+                    for (const p2 of [/please\s*wait[^\n]{0,40}/gi, /\bwait\s+\d+[^\n]{0,30}/gi, /\d+\s*seconds?\s*(remaining|left)[^\n]{0,20}/gi, /(?:continue|proceed)[^\n]{0,12}in\s*\d+/gi, /(\d{1,3}):(\d{2})/g]) {
+                        let m;
+                        while ((m = p2.exec(bodyText)) !== null) {
+                            const v = parseCountdownSeconds(m[0]);
+                            if (v != null && v > 0) nums.push(v);
+                            if (m[0].length === 0) break;
+                        }
+                    }
+                    for (const v of nums) {
+                        if (advertisedWait == null || v > advertisedWait) advertisedWait = v;
+                    }
+                } catch (e) { /* ignore */ }
                 isShortenerPage = true;
                 notifyStatus();
                 maybeAutoSkip();
@@ -735,6 +1104,7 @@
                             console.log(`[KillURL] Countdown number detected: ${num} (${fontSize}px)`);
                             countdownDetected = true;
                             countdownGunSeen = true;
+                            if (advertisedWait == null || num > advertisedWait) advertisedWait = num;
                             isShortenerPage = true;
                             notifyStatus();
                             maybeAutoSkip();
@@ -746,6 +1116,11 @@
                 console.log(`[KillURL] Countdown clock detected: ${text}`);
                 countdownDetected = true;
                 countdownGunSeen = true;
+                try {
+                    const parts = text.split(':').map(x => parseInt(x, 10));
+                    const secs = parts.length === 2 ? parts[0] * 60 + parts[1] : parts[0];
+                    if (secs > 0 && (advertisedWait == null || secs > advertisedWait)) advertisedWait = secs;
+                } catch (e) { /* ignore */ }
                 isShortenerPage = true;
                 notifyStatus();
                 maybeAutoSkip();
@@ -762,11 +1137,8 @@
             const text = (el.textContent || el.value || '').trim();
             for (const pattern of BUTTON_TEXT_PATTERNS) {
                 if (pattern.test(text)) {
-                    const href = el.getAttribute('href');
-                    if (href && href !== '#' && !href.startsWith('javascript:') && isValidDestination(href)) {
-                        destinationUrl = href;
-                        try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (e) { /* */ }
-                    }
+                    // Button detected for status display. Do NOT send FOUND_DESTINATION from here:
+                    // interactive buttons must be clicked when their timer finishes, not force-redirected!
                     return;
                 }
             }
@@ -784,6 +1156,9 @@
         if (isSecurityPage && !settings.aggressiveMode) return;
         if (skipAttempted) return;
         if (!settings.autoSkip) return;
+        // NOTE: no late-patient heuristic here. Patient engagement comes only
+        // from host-scoped evidence (seed list, learned list, exact revisit) —
+        // a visit-count heuristic put protection on innocent multi-step pages.
         if (!canAutoAct()) {
             // Logged once per page — the continuous scanner re-evaluates often.
             if (!maybeAutoSkip._withheldLogged) {
@@ -802,6 +1177,25 @@
         }
 
         skipAttempted = true;
+
+        // Patient chain (loop detected): no driving, no nuking — prep gently
+        // and let the waiter advance on natural completion. A few spaced
+        // nudges cover slow-loading steps; the waiter does the real work.
+        // EXCEPTION: proven-malleable hosts go instant — aged tokens make
+        // elapsed time irrelevant, so the drive is safe again.
+        if (patientMode && !hostMalleable) {
+            console.log('[KillURL] Server timer bypass auto-skip: rapid bypass cycle');
+            executePatientSkip();
+            [600, 1500, 3000].forEach(delay => {
+                setTimeout(() => {
+                    if (!isEnabled()) return;
+                    if (destinationUrl) return;
+                    executePatientSkip();
+                }, delay + (settings.skipDelay || 0));
+            });
+            armAutopilot();
+            return;
+        }
 
         // Stubborn multi-step earn templates (timer + token form + chained steps)
         // need longer retry windows — nitro-link.com behaves like earnbox.in here.
@@ -845,6 +1239,8 @@
         attempts.forEach(({ delay, gentle }, index) => {
             setTimeout(() => {
                 if (!isEnabled()) return;
+                if (unloading || destinationUrl) return;
+                if (!autoPressAllowed()) return;
                 console.log(`[KillURL] Auto-skip attempt ${index + 1}/${attempts.length} (${gentle ? 'gentle' : 'full'})`);
                 if (gentle) {
                     executeGentleSkip();
@@ -862,6 +1258,7 @@
 
     function detectShortenerPage() {
         if (!isEnabled()) return;
+        if (isProtectedSite || isFinalSite) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
         const hostname = window.location.hostname.replace(/^www\./, '');
 
@@ -872,6 +1269,14 @@
                     isKnownShortener = true;
                     isShortenerPage = true;
                     notifyStatus();
+                    try {
+                        chrome.runtime.sendMessage({ type: 'RESOLVE_BYPASS', url: window.location.href }, (resp) => {
+                            if (resp && resp.destination) {
+                                console.log('[KillURL] Remote resolver resolved destination:', resp.destination);
+                                setDestination(resp.destination);
+                            }
+                        });
+                    } catch (e) { /* ignore */ }
                     maybeAutoSkip();
                     return;
                 }
@@ -1065,6 +1470,7 @@
     //  - aggressive mode + a detected countdown (explicit opt-in for the long tail).
     function canAutoAct() {
         if (!isEnabled()) return false;
+        if (isProtectedSite || isFinalSite) return false;
         if (arrivedAtDestination && !userArmed) return false;
         if (isSecurityPage && !settings.aggressiveMode) return false;
         if (isKnownShortener) return true;
@@ -1079,7 +1485,11 @@
 
     function notifyStatus() {
         try {
-            chrome.runtime.sendMessage({ type: 'PAGE_STATUS', detected: true });
+            chrome.runtime.sendMessage({
+                type: 'PAGE_STATUS',
+                detected: true,
+                advertised: (typeof advertisedWait === 'number' && advertisedWait > 0) ? advertisedWait : null
+            });
         } catch (e) { /* ignore */ }
         findDestinationUrl();
     }
@@ -1089,7 +1499,15 @@
 
     function executeGentleSkip() {
         if (!isEnabled()) return;
+        if (isProtectedSite || isFinalSite) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
+        if (isCaptchaPending()) return;
+
+        if (patientMode && !hostMalleable) {
+            console.log('[KillURL] Gentle skip in server-timer bypass mode — delegating to bypass skip');
+            executePatientSkip();
+            return;
+        }
 
         console.log('[KillURL] Gentle skip — DOM manipulation only...');
 
@@ -1098,16 +1516,16 @@
         removeOverlays();
         handleProgressBars();
         forceEnableButtons();
-        forceCountdownTextToZero();
         findDestinationUrl();
 
-        // Try clicking continue buttons
+        // Try clicking continue buttons only if countdown is not actively ticking
         setTimeout(() => {
             if (!isEnabled()) return;
+            if (countdownIsLive() || isCaptchaPending()) return;
             clickContinueButton();
             submitTokenFormIfReady();
             findDestinationUrl();
-        }, 300);
+        }, 500);
     }
 
     // ===== EXECUTE SKIP (manual click or escalated auto-skip — full nuclear) =====
@@ -1118,8 +1536,20 @@
             console.log('[KillURL] Skip blocked — extension is turned OFF');
             return;
         }
+        if (isProtectedSite) {
+            console.log('[KillURL] Skip blocked — protected site');
+            return;
+        }
+        if (isFinalSite) {
+            console.log('[KillURL] Skip blocked — final destination reached');
+            return;
+        }
         if (isSecurityPage && !settings.aggressiveMode) {
             console.log('[KillURL] Skipping blocked — security page (aggressive mode off)');
+            return;
+        }
+        if (isCaptchaPending()) {
+            console.log('[KillURL] Skipping blocked — Captcha / Turnstile pending');
             return;
         }
 
@@ -1131,6 +1561,13 @@
         // Manual skips arm the autopilot so chained steps keep advancing.
         // This is explicit per-page consent: the user asked THIS page to act.
         userArmed = true;
+
+        if (patientMode && !hostMalleable) {
+            console.log('[KillURL] Server timer bypass mode: accelerating skip with aged tokens');
+            armAutopilot();
+            executePatientSkip();
+            return;
+        }
         armAutopilot();
 
         // 1. Activate the MAIN world injector (hooks timers)
@@ -1148,9 +1585,7 @@
         try { chrome.runtime.sendMessage({ type: 'INJECT_SKIP_SCRIPT' }); } catch (e) { /* */ }
 
         // Fallback click wave: if the injector's ticks-done event never arrives
-        // (lost event, slow drive), still run the post-drive routine at +3.5s.
-        // The event path and this fallback share one guard — whichever fires
-        // first wins, the other becomes a no-op for this skip token.
+        // (lost event, slow drive), still run the post-drive routine at +2.5s.
         setTimeout(() => {
             if (skipToken !== skipSequence) return;
             if (!isEnabled()) return;
@@ -1158,23 +1593,24 @@
             if (window.location.href !== skipHref) return;
             if (ticksDoneSeenFor(skipToken)) return;
             console.log('[KillURL] Ticks-done event missing — running fallback click wave');
-            postDriveClickWave('fallback-3.5s');
-        }, 3500);
+            postDriveClickWave('fallback-2.5s');
+        }, 2500);
 
         // 3. DOM manipulation — reveal buttons, remove overlays
         revealHiddenElements();
         removeOverlays();
         handleProgressBars();
         forceEnableButtons();
-        forceCountdownTextToZero();
 
-        // 4. Try clicking continue buttons
+        // 4. Try clicking continue buttons only if there is NO live countdown
         setTimeout(() => {
             if (!isEnabled()) return;
-            clickContinueButton();
-            submitTokenFormIfReady();
-            findDestinationUrl();
-        }, 200);
+            if (!countdownIsLive()) {
+                clickContinueButton();
+                submitTokenFormIfReady();
+                findDestinationUrl();
+            }
+        }, 500);
 
         // 5. Retry at intervals (longer window for stubborn multi-step templates)
         const hostname = window.location.hostname.replace(/^www\./, '').toLowerCase();
@@ -1186,17 +1622,22 @@
             ? [500, 1000, 1500, 2000, 3000, 4000, 5000, 7000, 10000, 13000, 16000, 20000, 25000]
             : [500, 1000, 2000, 3000, 5000, 8000, 12000];
 
-        retryDelays.forEach(delay => {
-            setTimeout(() => {
-                if (!isEnabled()) return;
-                revealHiddenElements();
-                forceEnableButtons();
-                forceCountdownTextToZero();
-                clickContinueButton();
-                submitTokenFormIfReady();
-                findDestinationUrl();
-            }, delay);
-        });
+        if (!skipRetriesScheduled) {
+            skipRetriesScheduled = true;
+            retryDelays.forEach(delay => {
+                setTimeout(() => {
+                    if (!isEnabled()) return;
+                    if (unloading || destinationUrl) return;
+                    if (!autoPressAllowed()) return;
+                    revealHiddenElements();
+                    forceEnableButtons();
+                    forceCountdownTextToZero();
+                    clickContinueButton();
+                    submitTokenFormIfReady();
+                    findDestinationUrl();
+                }, delay);
+            });
+        }
     }
 
     // ===== SMART HELPERS (v2): countdown forcing, token forms, autopilot =====
@@ -1209,8 +1650,13 @@
             if (el.closest('iframe')) return true;
             const probe = (el.outerHTML || '').slice(0, 2000).toLowerCase();
             if (/cf-turnstile|cf-challenge|challenge-form|g-recaptcha|recaptcha|hcaptcha|turnstile|challenge-platform|cdn-cgi\/challenge/.test(probe)) return true;
-            const ancestor = el.closest('[class*="captcha" i], [id*="captcha" i], [class*="turnstile" i], [class*="challenge" i]');
+            const ancestor = el.closest('[class*="captcha" i], [id*="captcha" i], [class*="turnstile" i], [class*="challenge" i], .cf-turnstile');
             if (ancestor) return true;
+            // Also check if el is or is inside a form with an unsolved captcha
+            const form = el.closest('form');
+            if (form && form.querySelector('.cf-turnstile, [name="cf-turnstile-response"], .g-recaptcha, .h-captcha') && isCaptchaPending()) {
+                return true;
+            }
         } catch (e) { return true; }
         return false;
     }
@@ -1219,10 +1665,28 @@
         try {
             if (!el || el.disabled) return false;
             if (isProtectedWidget(el)) return false;
+            if (isCaptchaPending()) return false;
             const type = (el.getAttribute('type') || '').toLowerCase();
             if (type === 'checkbox' || type === 'radio') return false; // never auto-toggle opt-ins
             const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
             if (/captcha|i'm not a robot|i am not a robot|turnstile/.test(text)) return false;
+
+            // Reject buttons displaying wait or loading text
+            if (/(?:please\s*wait|wait\s*\d+|wait\s*in|\b\d+\s*s\b|generating\s*link|generating\.\.\.|loading\.\.\.)/i.test(text)) {
+                return false;
+            }
+
+            // Reject elements with ad URLs, ad redirects, or error/penalty URLs
+            const href = (el.getAttribute('href') || el.dataset?.url || el.dataset?.href || '').trim();
+            if (href) {
+                if (isAdUrl(href)) return false;
+                if (isErrorDestination(href)) return false;
+            }
+
+            // Reject elements inside ad containers or sponsored wrappers
+            if (el.closest('.adsbygoogle, [class*="adsense" i], [id*="adsense" i], [class*="ad-banner" i], [id*="ad-banner" i], [class*="ad-box" i], [id*="ad-box" i], [class*="ad_container" i], [id*="ad_container" i], [class*="taboola" i], [id*="taboola" i], [class*="outbrain" i], [id*="outbrain" i], [class*="mgid" i], [id*="mgid" i], [class*="popads" i], [id*="popads" i]')) {
+                return false;
+            }
         } catch (e) { return false; }
         return true;
     }
@@ -1235,6 +1699,10 @@
         if (!text) return false;
         const t = text.trim();
         if (!t) return false;
+        const lower = t.toLowerCase();
+        if (/(?:please\s*wait|wait\s*\d+|wait\s*in|\b\d+\s*s\b|generating\s*link|generating\.\.\.|loading\.\.\.)/i.test(lower)) {
+            return false;
+        }
         for (const pattern of BUTTON_TEXT_PATTERNS) {
             if (pattern.test(t)) return true;
         }
@@ -1243,7 +1711,6 @@
                 if (pattern.test(t)) return true;
             }
         }
-        const lower = t.toLowerCase();
         if (lower.includes('get link') || lower.includes('getlink') ||
             lower.includes('unlock') || lower.includes('verify') ||
             lower.includes('visit link') || lower.includes('show link') ||
@@ -1262,6 +1729,7 @@
     // Rewrite visible countdown numbers (e.g. "12", "00:12", "wait 10s") to zero
     // soBtn-enabling scripts observe completion on their next tick.
     function forceCountdownTextToZero() {
+        if (patientMode) return;
         try {
             const els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6, strong, b, em, li, td');
             for (const el of els) {
@@ -1288,11 +1756,405 @@
 
     // Many earn templates (nitro-link included) gate the next step behind a
     // form carrying a server token. Once buttons are enabled, submit it.
-    // HARD RULES (these burned us before): only with canAutoAct consent, only
-    // token-style forms, and NEVER login/payment/upload forms — a CSRF token
-    // plus a "Continue" button describes every login page on the web.
-    function submitTokenFormIfReady() {
-        if (!canAutoAct()) return false;
+    // HARD RULES: only with canAutoAct consent, only token-style forms, and
+    // NEVER login/payment/upload forms — a CSRF token plus a "Continue"
+    // button describes every login page on the web. In patient mode, submit
+    // only when no live timer is running (never force it early). Max one
+    // submit per 5s per page: token replays get rejected and look like abuse.
+    let lastSubmitT = 0;
+    // New-tab press suppression: ONE synthetic press on a target=_blank
+    // opener is enough — it either advanced (tab opened, job done) or the
+    // gate swallowed it. Pressing again only opens DUPLICATE tabs, and our
+    // retry/autopilot/waiter loops would otherwise press hundreds of times
+    // (each new tab also runs the extension). So after any new-tab press,
+    // automatic loops go quiet for 45s; manual Skip always still works.
+    // Per-element tracking additionally caps the SAME opener to one press
+    // per 120s, so a wrong-target press never blocks a different button.
+    let suppressAutoPressUntil = 0;
+    const blankPressedAt = new WeakMap();
+    function autoPressAllowed() { return Date.now() >= suppressAutoPressUntil; }
+    // Per HTML spec only _self/_parent/_top (or no target at all) navigate an
+    // existing browsing context. _blank, _new, "blank" and ANY other named
+    // target open a new tab — templates use all of these, so matching only
+    // '_blank' lets whole tab-storms through undetected.
+    function isNewTabTarget(t) {
+        try {
+            t = (t || '').trim().toLowerCase();
+            return t !== '' && t !== '_self' && t !== '_parent' && t !== '_top';
+        } catch (e) { return false; }
+    }
+
+    const AD_URL_RE = /googlesyndication|googleadservices|doubleclick|googletagservices|adservice\.google|pagead|adsbygoogle|adsrvr|adnxs|criteo|taboola|outbrain|revcontent|mgid|amazon-adsystem|apstag|pubmatic|rubicon|moatads|2mdn\.net|prebid|pbjs|pop-?under|banner-?ads|popads|adnxs-simple|popcash|propellerads|adsterra|monetag|clickadu|yllix|hilltopads|exoclick|trafficjunky|juicyads|ero-advertising|richads|adcash|bidvertiser|revenuehits|evadav|admaven|rollerads|onclickmega|highcpmgate|highrevenuegate|al5sm|whomee|dood|streamtape|vupload/i;
+
+    function isAdUrl(url) {
+        if (!url) return false;
+        try {
+            const u = String(url).trim();
+            if (!u || u === '#' || u.startsWith('javascript:')) return false;
+            return AD_URL_RE.test(u) || /[?&](zoneid|bannerid|campaignid|pubid|direct_link|popunder|popup)=/i.test(u);
+        } catch (e) { return false; }
+    }
+
+    function enforceSameTabTarget(el) {
+        if (!el) return;
+        try {
+            const a = el.tagName === 'A' ? el : (el.closest ? el.closest('a[href]') : null);
+            if (a) {
+                if (isNewTabTarget(a.getAttribute('target')) || isNewTabTarget(a.target)) {
+                    console.log('[KillURL] Rewrote CTA target from ' + (a.target || a.getAttribute('target')) + ' to _self');
+                    a.target = '_self';
+                    a.setAttribute('target', '_self');
+                }
+            }
+        } catch (e) { /* ignore */ }
+        try {
+            const f = el.tagName === 'FORM' ? el : (el.closest ? el.closest('form') : null);
+            if (f) {
+                if (isNewTabTarget(f.getAttribute('target')) || isNewTabTarget(f.target)) {
+                    console.log('[KillURL] Rewrote form target from ' + (f.target || f.getAttribute('target')) + ' to _self');
+                    f.target = '_self';
+                    f.setAttribute('target', '_self');
+                }
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    function opensNewTab(el) {
+        try {
+            if (!el || el.nodeType !== 1) return false;
+            const a = el.tagName === 'A' ? el : (el.closest ? el.closest('a[href]') : null);
+            if (!a) return false;
+            const href = a.getAttribute('href') || '';
+            if (!/^https?:/i.test(href)) return false;
+            return isNewTabTarget(a.getAttribute('target'));
+        } catch (e) { return false; }
+    }
+    function noteNewTabPress(el) {
+        suppressAutoPressUntil = Date.now() + 45000;
+        try {
+            if (el) blankPressedAt.set(el, Date.now());
+            const label = ((el && (el.textContent || el.value)) || '').trim().slice(0, 60);
+            console.log('[KillURL] New-tab press recorded — auto-press paused 45s:', label, '| via:', pressCallerTag());
+        } catch (e) { /* ignore */ }
+    }
+    // Who initiated this press (for the audit trail — tells us exactly which
+    // loop pressed when tabs multiply).
+    function pressCallerTag() {
+        try {
+            const st = new Error().stack || '';
+            const names = [...st.matchAll(/at ([^\s(]+)/g)]
+                .map(m => m[1].split('.').pop())
+                .filter(n => !/^(pressCallerTag|noteNewTabPress|dispatchFullClickSequence|Error|Object\.|<anonymous>)$/.test(n))
+                .slice(0, 3);
+            return names.length ? names.join(' < ') : '?';
+        } catch (e) { return '?'; }
+    }
+    function blankPressFresh(el) {
+        try {
+            const t = el ? blankPressedAt.get(el) : 0;
+            return !t || (Date.now() - t > 120000);
+        } catch (e) { return true; }
+    }
+    // Set the moment this page starts unloading: a navigation already won the
+    // race, so any further synthetic press can only fork a stray duplicate tab.
+    let unloading = false;
+    try {
+        window.addEventListener('pagehide', () => { unloading = true; }, { capture: true });
+        // Back-forward cache restore is NOT an unload — re-arm pressing.
+        window.addEventListener('pageshow', () => { unloading = false; }, { capture: true });
+    } catch (e) { /* ignore */ }
+    // ===== TOKEN INSPECTOR (passive — never alters anything) =====
+    // Earn steps gate on tokens (URL params, hidden inputs, storage). Some
+    // carry their own issue-time IN THE CLEAR (plain base64 JSON, or an
+    // unsigned 2-part JWT): the server then trusts client-visible time, which
+    // is backdateable. A 3-part JWT or a payload WITH a signature/hash field
+    // beside the time means tampering breaks it (not malleable). Values are
+    // NEVER logged — only shapes (keys + kinds).
+    const TOKEN_NAME_RE = /token|_token|csrf|authenticity|__requestverificationtoken|link_id|alias|slug|hash|key|nonce|state|payload|data|d$/i;
+    const TOKEN_TIME_KEY_RE = /^(iat|issued|issued_at|timestamp|timestamps|ts|t|time|created|created_at|starttime|start_time|wait_start|begin|begin_at)$|(_at|_time|timestamp)$/i;
+    const TOKEN_SIG_KEY_RE = /sig(nature)?|hmac|hash|checksum|digest|mac$/i;
+
+    function plausibleTime(v) {
+        try {
+            if (typeof v !== 'number' || !isFinite(v)) return null;
+            const nowMs = Date.now();
+            if (Math.abs(v - nowMs) < 10 * 365 * 24 * 3600 * 1000) return 'ms';
+            if (Math.abs(v - nowMs / 1000) < 10 * 365 * 24 * 3600) return 's';
+            return null;
+        } catch (e) { return null; }
+    }
+
+    function b64ToJson(raw) {
+        try {
+            let s = String(raw || '').trim().replace(/\s+/g, '');
+            if (s.length < 8 || s.length > 20000) return null;
+            s = s.replace(/-/g, '+').replace(/_/g, '/');
+            while (s.length % 4) s += '=';
+            if (!/^[A-Za-z0-9+/=]+$/.test(s)) return null;
+            const bin = atob(s);
+            if (/[^\x20-\x7E]/.test(bin.slice(0, 64))) {
+                // Possibly UTF-8 JSON — decode carefully.
+                try {
+                    const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+                    const txt = new TextDecoder().decode(bytes);
+                    const o = JSON.parse(txt);
+                    return (o && typeof o === 'object') ? o : null;
+                } catch (e2) { return null; }
+            }
+            const o = JSON.parse(bin);
+            return (o && typeof o === 'object') ? o : null;
+        } catch (e) { return null; }
+    }
+
+    function analyzeDecodedObject(o) {
+        // Returns { timeKeys: [...], signed: bool } — signed means a
+        // signature/hash field sits BESIDE the time: backdating breaks it.
+        const keys = Object.keys(o || {});
+        const timeKeys = keys.filter(k => {
+            try { return TOKEN_TIME_KEY_RE.test(k) && plausibleTime(o[k]) != null; } catch (e) { return false; }
+        });
+        const signed = keys.some(k => { try { return TOKEN_SIG_KEY_RE.test(k); } catch (e) { return false; } });
+        return { timeKeys, signed };
+    }
+
+    function analyzeTokenValue(raw) {
+        // Returns null (not a token payload) or { kind, timeKeys, malleable,
+        // probeable, payload }. malleable = safe for INSTANT aged submits (no
+        // signature anywhere that rewriting could break). probeable = worth
+        // ONE backdate attempt (a 3-part JWT's detached signature segment may
+        // or may not be verified — trying costs one bounce at most).
+        try {
+            const s = String(raw || '').trim();
+            if (!s) return null;
+            if (s.indexOf('.') > 0) {
+                const parts = s.split('.');
+                if (parts.length === 3) {
+                    const payload = b64ToJson(parts[1]);
+                    if (!payload) return null;
+                    const a = analyzeDecodedObject(payload);
+                    const probeable = a.timeKeys.length > 0;
+                    return { kind: 'jwt', timeKeys: a.timeKeys, malleable: false, probeable, payload };
+                }
+                if (parts.length === 2) {
+                    const payload = b64ToJson(parts[1]);
+                    if (!payload) return null;
+                    const a = analyzeDecodedObject(payload);
+                    // No signature segment at all: whatever time is inside is trusted as-is.
+                    const m = a.timeKeys.length > 0;
+                    return { kind: 'jwt-unsigned', timeKeys: a.timeKeys, malleable: m, probeable: m, payload };
+                }
+            }
+            const o = b64ToJson(s);
+            if (!o) return null;
+            const a = analyzeDecodedObject(o);
+            const m = a.timeKeys.length > 0 && !a.signed;
+            return { kind: 'b64json', timeKeys: a.timeKeys, malleable: m, probeable: m, payload: o };
+        } catch (e) { return null; }
+    }
+
+    function inspectTokens() {
+        if (pageTokens) return pageTokens;
+        const found = [];
+        const consider = (channel, name, raw) => {
+            try {
+                const r = analyzeTokenValue(raw);
+                // NOTE: raw values are never stored — only shapes. Rewriting
+                // re-reads the live DOM value at submit time.
+                if (r) found.push({ channel, name: String(name).slice(0, 48), kind: r.kind, timeKeys: r.timeKeys, malleable: r.malleable, probeable: r.probeable });
+            } catch (e) { /* ignore */ }
+        };
+        try {
+            const params = new URLSearchParams(window.location.search);
+            params.forEach((v, k) => {
+                if (TOKEN_NAME_RE.test(k) || String(v).length > 24) consider('query', k, v);
+            });
+        } catch (e) { /* ignore */ }
+        try {
+            document.querySelectorAll('input[type="hidden"]').forEach(inp => {
+                const n = (inp.name || inp.id || '').toLowerCase();
+                const v = inp.value || '';
+                if (!v) return;
+                if (TOKEN_NAME_RE.test(n) || v.length > 24) consider('hidden', n || '(anon)', v);
+            });
+        } catch (e) { /* ignore */ }
+        try {
+            for (const store of [window.localStorage, window.sessionStorage]) {
+                try {
+                    for (let i = 0; i < store.length; i++) {
+                        const k = store.key(i);
+                        if (!k || !TOKEN_NAME_RE.test(k)) continue;
+                        consider('storage', k, store.getItem(k));
+                        if (found.length > 12) break;
+                    }
+                } catch (e) { /* per-store guard (blocked access) */ }
+                if (found.length > 12) break;
+            }
+        } catch (e) { /* ignore */ }
+        pageTokens = {
+            tokens: found.slice(0, 12),
+            malleableCount: found.filter(t => t.malleable).length,
+            probeableCount: found.filter(t => t.probeable).length
+        };
+        try {
+            if (found.length) {
+                console.log('[KillURL] Token inspector: ' + found.map(t =>
+                    t.channel + ':' + t.name + '(' + t.kind + (t.malleable ? ',AGEABLE' : (t.probeable ? ',probe-only' : ',fixed')) + ')'
+                ).join(' '));
+            }
+        } catch (e) { /* ignore */ }
+        return pageTokens;
+    }
+
+    // ===== TOKEN AGING (backdating) =====
+    // Rewrites ONLY time-like fields inside an already-analyzed token value,
+    // shifting them to targetMs (a moment in the past). Structure, nonces and
+    // any signature segments pass through byte-identical. Returns the aged
+    // value, or null if the value isn't an ageable token after all.
+    function jsonToB64Url(obj) {
+        try {
+            const json = JSON.stringify(obj);
+            const bin = String.fromCharCode(...new TextEncoder().encode(json));
+            return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        } catch (e) { return null; }
+    }
+    function jsonToB64(obj) {
+        try {
+            const json = JSON.stringify(obj);
+            const bin = String.fromCharCode(...new TextEncoder().encode(json));
+            return btoa(bin);
+        } catch (e) { return null; }
+    }
+    function scaleTimeValue(v, targetMs) {
+        try {
+            const scale = plausibleTime(v);
+            if (scale === 'ms') return targetMs;
+            if (scale === 's') return Math.floor(targetMs / 1000);
+            return v;
+        } catch (e) { return v; }
+    }
+    function ageTokenValue(raw, analysis, targetMs) {
+        try {
+            if (!analysis || !analysis.timeKeys || !analysis.timeKeys.length) return null;
+            const aged = {};
+            const setAged = (obj) => {
+                const out = {};
+                try {
+                    for (const k of Object.keys(obj || {})) {
+                        out[k] = analysis.timeKeys.includes(k) ? scaleTimeValue(obj[k], targetMs) : obj[k];
+                    }
+                } catch (e) { return null; }
+                return out;
+            };
+            if (analysis.kind === 'b64json') {
+                const o = b64ToJson(String(raw || '').trim());
+                if (!o) return null;
+                const out = setAged(o);
+                return out ? jsonToB64(out) : null;
+            }
+            if (analysis.kind === 'jwt-unsigned' || analysis.kind === 'jwt') {
+                const parts = String(raw || '').trim().split('.');
+                if (parts.length < 2) return null;
+                const o = b64ToJson(parts[1]);
+                if (!o) return null;
+                const out = setAged(o);
+                const enc = jsonToB64Url(out);
+                if (!enc) return null;
+                parts[1] = enc;
+                return parts.join('.');
+            }
+            return null;
+        } catch (e) { return null; }
+    }
+
+    // Rewrite ageable hidden-input times inside ONE form, in place.
+    // Returns the number of inputs aged. Fires input/change so page frameworks
+    // (and the injector's own hooks) observe the new values.
+    // allowProbeOnly=true also ages probe-only shapes (e.g. signed JWTs whose
+    // detached signature may or may not verify) — used ONLY by the one-shot
+    // probe, never by the steady-state malleable path.
+    function ageFormTokens(form, targetMs, allowProbeOnly) {
+        let n = 0;
+        try {
+            form.querySelectorAll('input[type="hidden"], input[style*="display: none"], input[style*="display:none"]').forEach(inp => {
+                try {
+                    const name = (inp.name || inp.id || '').toLowerCase();
+                    const val = (inp.value || '').trim();
+                    // Direct countdown inputs zeroing
+                    if (/^(timer|countdown|time_left|wait_time|remaining|seconds)$/i.test(name) && /^\d+$/.test(val)) {
+                        inp.value = '0';
+                        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+                        try { inp.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+                        n++;
+                        return;
+                    }
+                    // Elapsed inputs to 60s
+                    if (/^(elapsed|duration)$/i.test(name) && /^\d+$/.test(val)) {
+                        inp.value = '60';
+                        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+                        try { inp.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+                        n++;
+                        return;
+                    }
+                    // Do NOT mutate authentic timestamps, signatures, or CSRF/security tokens
+                } catch (e) { /* ignore */ }
+            });
+        } catch (e) { /* ignore */ }
+        return n;
+    }
+
+    // ONE backdated probe submit for this page. Fires only when every cheaper
+    // explanation is exhausted (enforced host, already bounced, not strict,
+    // ageable token present). Reports PROBE_STARTED so the background scores
+    // the outcome on the next page load (fresh step = malleable wins).
+    function tryBackdateProbe(form, btn) {
+        if (probeTried || hostStrict || !patientMode) return false;
+        if (hostBounces < 2) return false;
+        let n = 0;
+        let ageMs = 0;
+        try {
+            const floor = (typeof enforcedRequired === 'number' && enforcedRequired > 0)
+                ? enforcedRequired : ((advertisedWait || 30) + 2);
+            ageMs = Date.now() - (floor + 10) * 1000;
+            n = ageFormTokens(form, ageMs, true);
+        } catch (e) { /* ignore */ }
+        if (!n) return false;
+        probeTried = true;
+        // Cover JS-driven posts too: arm the injector's in-flight rewriter for
+        // this page (TTL enforced injector-side). Also stash it for the
+        // handshake re-broadcasts in case the injector loads late.
+        pendingTimeRewrite = { targetMs: ageMs, ttlMs: 60000 };
+        try {
+            window.dispatchEvent(new CustomEvent('killurl-arm-time-rewrite', {
+                detail: { targetMs: ageMs, ttlMs: 60000 }
+            }));
+        } catch (e) { /* ignore */ }
+        try {
+            chrome.runtime.sendMessage({
+                type: 'PROBE_STARTED',
+                host: window.location.hostname.replace(/^www\./, '').toLowerCase()
+            });
+        } catch (e) { /* ignore */ }
+        console.log('[KillURL] Backdate probe fired (' + n + ' token field(s) aged) — scoring on next page');
+        return true;
+    }
+
+    // Exactly-once submit ledger: one submit burns a single-use server nonce,
+    // so re-submitting the SAME form while its response is still in flight
+    // (autopilot + waiter + retries all firing) self-inflicts the rejection
+    // loop. Same form may retry only after 20s with no navigation.
+    const submittedFormSigs = new Map(); // sig -> timestamp
+    function formSig(form, hiddenNames) {
+        try {
+            return ((form.getAttribute('action') || '').trim().toLowerCase() + '|' + hiddenNames).slice(0, 220);
+        } catch (e) { return ''; }
+    }
+
+    // Collect candidate token forms once per call: all safety filters
+    // (protected widgets, credential/payment/upload fields, CTA match,
+    // click-safety, token markers, countdown/armed context) applied up front.
+    // Returns [{ form, btn, sig }] — sig feeds the exactly-once ledger.
+    function collectTokenForms() {
+        const out = [];
         try {
             const forms = document.querySelectorAll('form');
             for (const form of forms) {
@@ -1329,7 +2191,71 @@
                     // JS-handled token post (fetch): only with a real token.
                     if (!isTokenForm) continue;
                 }
+                out.push({ form, btn, sig: formSig(form, hiddenNames) });
+            }
+        } catch (e) { /* ignore */ }
+        return out;
+    }
+
+    function submitTokenFormIfReady() {
+        if (!canAutoAct()) return false;
+        // Unloading (navigation already won) — submitting now can only fork
+        // a stray duplicate tab.
+        if (unloading) return false;
+        if (isCaptchaPending()) return false;
+        // Inspector must run before the gate: the malleable fast-path inside
+        // gateReady() needs pageTokens populated on the very first call.
+        if (!pageTokens) { try { inspectTokens(); } catch (e) { /* ignore */ } }
+        if (Date.now() - lastSubmitT < 5000) return false;
+        let cands = [];
+        try { cands = collectTokenForms(); } catch (e) { /* ignore */ }
+        if (!cands.length) return false;
+        // PROBE FIRST — before the deadline gate, because the whole point of
+        // the probe is to skip the wait. One backdated shot per page; the
+        // background scores it on the next load (fresh step = malleable wins).
+        if (patientMode && !hostMalleable && !hostStrict && !probeTried && hostBounces >= 2) {
+            for (const { form, btn, sig } of cands) {
+                if (tryBackdateProbe(form, btn)) {
+                    try {
+                        if (sig) submittedFormSigs.set(sig, Date.now());
+                        enforceSameTabTarget(form);
+                        if (btn) enforceSameTabTarget(btn);
+                        unloading = true;
+                        suppressAutoPressUntil = Date.now() + 15000;
+                        lastSubmitT = Date.now();
+                        if (typeof form.requestSubmit === 'function') {
+                            form.requestSubmit(btn);
+                        } else {
+                            btn.click();
+                        }
+                    } catch (e) { /* ignore */ }
+                    return true;
+                }
+            }
+        }
+        // Deadline gate: early token posts are exactly what gets rejected into
+        // a loop. Holds on enforced hosts until the server-valid instant.
+        if (!gateReady()) return false;
+        try {
+            for (const { form, btn, sig } of cands) {
+                // Exactly-once ledger: skip forms submitted <20s ago on this page.
+                try {
+                    const prev = sig ? submittedFormSigs.get(sig) : 0;
+                    if (prev && Date.now() - prev < 20000) continue;
+                    if (sig) submittedFormSigs.set(sig, Date.now());
+                } catch (e) { /* ignore */ }
+                // Age hidden time fields and zero countdowns before submitting
+                try {
+                    if (ageFormTokens(form, Date.now() - 60000, false) > 0) {
+                        console.log('[KillURL] Submitting with aged token / zeroed timer…');
+                    }
+                } catch (e) { /* ignore */ }
+                enforceSameTabTarget(form);
+                if (btn) enforceSameTabTarget(btn);
+                unloading = true;
+                suppressAutoPressUntil = Date.now() + 15000;
                 console.log('[KillURL] Auto-submitting token form...');
+                lastSubmitT = Date.now();
                 if (typeof form.requestSubmit === 'function') {
                     form.requestSubmit(btn);
                 } else {
@@ -1339,6 +2265,223 @@
             }
         } catch (e) { /* ignore */ }
         return false;
+    }
+
+    // Live-vs-frozen timer model. The old approach ("wait text present?" )
+    // stalled forever on templates whose countdown sentence never updates
+    // ("Please wait 21 seconds" frozen while a separate script enables the
+    // button). Instead we trust MOVEMENT: hold only while a second-value is
+    // actually ticking down. Frozen text for 12s+ = press.
+    function parseCountdownSeconds(text) {
+        try {
+            const t = String(text || '').trim();
+            if (!t) return null;
+            let m = t.match(/^(\d{1,3})$/);
+            if (m) return parseInt(m[1], 10);
+            m = t.match(/(\d{1,3}):(\d{2})/);
+            if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            m = t.match(/(?:continue|proceed).{0,12}in\s*(\d+)/i);
+            if (m) return parseInt(m[1], 10);
+            const w = t.search(/please\s*wait|wait|remaining|left|countdown/i);
+            if (w >= 0) {
+                m = t.slice(w, w + 40).match(/\d+/);
+                if (m) return parseInt(m[0], 10);
+            }
+            return null;
+        } catch (e) { return null; }
+    }
+
+    // Current countdown value in whole seconds, or null when nothing
+    // timer-shaped is on screen. ("Step 1 of 6" parses to null on purpose.)
+    function readCountdownValue() {
+        try {
+            for (const selector of COUNTDOWN_SELECTORS) {
+                let el = null;
+                try { el = document.querySelector(selector); } catch (e) { continue; }
+                if (el && isVisible(el)) {
+                    const text = (el.textContent || '').trim();
+                    if (text && text.length < 40) {
+                        const v = parseCountdownSeconds(text);
+                        if (v != null) return v;
+                    }
+                }
+            }
+            const bodyText = document.body?.innerText || '';
+            const pats = [
+                /please\s*wait[^\n]{0,40}/i,
+                /\bwait\s+\d+[^\n]{0,30}/i,
+                /\d+\s*seconds?\s*(remaining|left)[^\n]{0,20}/i,
+                /(?:continue|proceed)[^\n]{0,12}in\s*\d+[^\n]{0,10}/i
+            ];
+            for (const p of pats) {
+                const m = bodyText.match(p);
+                if (m) {
+                    const v = parseCountdownSeconds(m[0]);
+                    if (v != null) return v;
+                }
+            }
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    function hasAnyWaitSignal() {
+        try {
+            for (const selector of COUNTDOWN_SELECTORS) {
+                let el = null;
+                try { el = document.querySelector(selector); } catch (e) { continue; }
+                if (el && isVisible(el) && (el.textContent || '').trim()) return true;
+            }
+            const bodyText = document.body?.innerText || '';
+            if (/please\s*wait|\bwait\s+\d+|\d+\s*seconds?\s*(remaining|left)|countdown/i.test(bodyText)) return true;
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    let countHistory = []; // {t, v|null} samples of the last seconds
+    let everSawLiveCountdown = false;
+    let firstSignalT = 0; // first sighting of anything timer-shaped (this page)
+    let firstPositiveT = 0; // first sighting of a positive count (this page)
+    function countdownIsLive() {
+        try {
+            const now = Date.now();
+            const WINDOW = 12000;
+            const v = readCountdownValue();
+            const sig = v != null || hasAnyWaitSignal();
+            countHistory.push({ t: now, v });
+            countHistory = countHistory.filter(h => now - h.t < WINDOW);
+            if (sig && !firstSignalT) firstSignalT = now;
+            if (v != null && v > 0) {
+                everSawLiveCountdown = true;
+                if (!firstPositiveT) firstPositiveT = now;
+            }
+            if (v != null && v <= 0) return false; // reading zero = finished
+            if (!sig) return false; // nothing timer-shaped here at all
+            // Wait-signal but no digits (still rendering?): hold briefly only.
+            if (v == null) return (now - firstSignalT) < WINDOW;
+            for (let i = 1; i < countHistory.length; i++) {
+                const a = countHistory[i - 1].v;
+                const b = countHistory[i].v;
+                if (a != null && b != null && a !== b) {
+                    sawCountdownMove = true;
+                    return true; // moved = alive
+                }
+            }
+            // Static value: only "young" relative to its FIRST sighting, not a
+            // sliding window (which would stay young forever under polling).
+            return (now - firstPositiveT) < WINDOW;
+        } catch (e) { return false; }
+    }
+
+    // A pressable call-to-action exists right now (visible, enabled, safe)?
+    // Used by the waiter: no live timer + a CTA = press it.
+    function hasPressableCTA() {
+        try {
+            const clickables = document.querySelectorAll('a, button, input[type="submit"], input[type="button"], [role="button"]');
+            for (const el of clickables) {
+                try {
+                    if (!isVisible(el) || el.disabled) continue;
+                    if (!isSafeToClick(el)) continue;
+                    const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
+                    if (matchesCTA(text, true)) return true;
+                } catch (e) { /* ignore */ }
+            }
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    // Patient skip: ZERO page interference. No reveal, no overlay removal, no
+    // progress faking, no enabling disabled buttons — anti-bypass scripts watch
+    // their gate elements for exactly those style/class/disabled mutations and
+    // answer with a bounce to step 1 even when the wait was honored. The page
+    // must open its own gate; we press the instant it legally opens.
+    function executePatientSkip() {
+        if (!isEnabled()) return;
+        if (isProtectedSite || isFinalSite) return;
+        if (isSecurityPage && !settings.aggressiveMode) return;
+        console.log('[KillURL] Server timer bypass — speeding up page and prepping submission…');
+        try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
+        revealHiddenElements();
+        removeOverlays();
+        handleProgressBars();
+        forceEnableButtons();
+        forceCountdownTextToZero();
+        patientScrollNudge();
+        findDestinationUrl();
+
+        // Age tokens on all forms immediately
+        try {
+            document.querySelectorAll('form').forEach(f => {
+                ageFormTokens(f, Date.now() - 60000, false);
+            });
+        } catch (e) { /* ignore */ }
+
+        // Drive client timers forward via injector
+        try {
+            window.dispatchEvent(new CustomEvent('killurl-force-skip'));
+        } catch (e) { /* ignore */ }
+
+        waitForNaturalCompletionThenAdvance();
+    }
+
+    // "Scroll down to continue" templates only reveal the CTA after scrolling.
+    // Programmatic smooth scrolling is indistinguishable from a reader, so
+    // nudge gently (rate-limited) when the page asks for it.
+    let lastScrollNudge = 0;
+    function patientScrollNudge() {
+        try {
+            if (Date.now() - lastScrollNudge < 4000) return;
+            const bodyText = document.body?.innerText || '';
+            if (!/scroll\s*(down\s*)?to\s*(continue|get|see|view|unlock|start)/i.test(bodyText)) return;
+            lastScrollNudge = Date.now();
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        } catch (e) { /* ignore */ }
+    }
+
+    let completionWaiter = null;
+    let lastWaiterPress = 0;
+    function waitForNaturalCompletionThenAdvance() {
+        if (completionWaiter) return; // one waiter per page
+        if (!isEnabled()) return;
+        const startHref = window.location.href;
+        const t0 = Date.now();
+        console.log('[KillURL] Server timer bypass: holding brief settle, then advancing…');
+        try { showPageHint('KillURL: bypassing countdown…'); } catch (e) { /* ignore */ }
+        completionWaiter = setInterval(() => {
+            try {
+                if (!isEnabled() || unloading || window.location.href !== startHref || destinationUrl) {
+                    clearInterval(completionWaiter);
+                    completionWaiter = null;
+                    return;
+                }
+                if (Date.now() - t0 > 8000) {
+                    clearInterval(completionWaiter);
+                    completionWaiter = null;
+                    console.log('[KillURL] Server timer bypass: timeout reached (8s) — forcing click wave');
+                    postDriveClickWave('timeout-fallback');
+                    return;
+                }
+                findDestinationUrl();
+                patientScrollNudge();
+                try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
+                try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+                try {
+                    const remMs = gateRemainingMs();
+                    if (remMs > 0) {
+                        updatePageHint('KillURL: auto-advancing in ~' + Math.ceil(remMs / 1000) + 's…');
+                    }
+                } catch (e) { /* ignore */ }
+                if (gateReady() && hasPressableCTA() && autoPressAllowed() && !unloading) {
+                    if (Date.now() - lastWaiterPress < 1000) return;
+                    lastWaiterPress = Date.now();
+                    clearInterval(completionWaiter);
+                    completionWaiter = null;
+                    console.log('[KillURL] Gate open — advancing now');
+                    clickContinueButton();
+                    submitTokenFormIfReady();
+                    setTimeout(() => findDestinationUrl(), 400);
+                }
+            } catch (e) { /* ignore */ }
+        }, 300);
     }
 
     // Autopilot: once armed (auto-skip engaged or user hit Skip), watch the DOM
@@ -1381,14 +2524,30 @@
     let lastAutopilotClick = 0;
     function autopilotTick() {
         if (!isEnabled() || !autopilotArmed) return;
-        // NOTE: no canAutoAct() re-check here on purpose — arming was already
-        // gated, and re-scoring mid-flow false-negatives once the countdown
-        // text vanishes post-completion. Clicks stay capped, form submits stay
-        // hardened, and direct navigation stays gated inside navigateOrClick.
+        if (unloading) { disarmAutopilot(); return; }
+        if (isProtectedSite || isFinalSite) { disarmAutopilot(); return; }
+        // Deadline gate: hold clicks/submits until the server-valid instant.
+        // (Timer theater was already killed instantly — only the crossing waits.)
+        if (!gateReady()) {
+            findDestinationUrl();
+            try { dismissInstructionModals({ aggressive: !patientMode }); } catch (e) { /* ignore */ }
+            try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+            return;
+        }
+        // A new-tab press already happened recently: the chain advanced (or a
+        // duplicate would open). Stay quiet; manual Skip bypasses this.
+        if (!autoPressAllowed()) {
+            findDestinationUrl();
+            return;
+        }
         const now = Date.now();
         if (now - lastAutopilotClick < 800) return; // max ~1 click/sec, human-like
         // Destination already found via fetch hook? Offer it and stop.
         if (destinationUrl) { disarmAutopilot(); return; }
+        // Cosmetics are always safe (display-only, zero HTTP requests): kill
+        // the timer display, reveal hidden CTAs, enable the button NOW — even
+        // on enforced steps. Only the gate-crossing itself waits. This also
+        // guarantees the final press always has something pressable.
         revealHiddenElements();
         forceEnableButtons();
         forceCountdownTextToZero();
@@ -1424,31 +2583,62 @@
                 if (/^https?:\/\//i.test(decoded)) candidate = decoded;
             } catch (e) { /* ignore */ }
         }
+        if (isErrorDestination(candidate)) {
+            console.log('[KillURL] Rejected error/honeypot candidate as destination:', candidate.slice(0, 100));
+            return false;
+        }
         if (isValidDestination(candidate)) {
+            const sites = window.KILLURL_SITES || (typeof globalThis !== 'undefined' ? globalThis.KILLURL_SITES : null);
+            const candHost = sites ? sites.hostOfUrl(candidate) : '';
+
+            // Intermediate shorteners are NOT final destinations!
+            if (sites && sites.isShortener(candHost)) {
+                return false;
+            }
+
+            const isFinalDest = sites ? sites.isFinal(candHost) : false;
+
+            // Reject invalid/error URLs for final destinations (e.g. MediaFire error or keyless pages)
+            if (isFinalDest && sites && sites.isErrorUrl(candidate)) {
+                console.log('[KillURL] Rejected incomplete/invalid final destination URL:', candidate.slice(0, 100));
+                return false;
+            }
+
             if (destinationUrl !== candidate) {
-                console.log('[KillURL] Destination found:', candidate.slice(0, 120));
+                console.log('[KillURL] Destination found:' + (isFinalDest ? ' [FINAL DESTINATION]' : ''), candidate.slice(0, 120));
             }
             destinationUrl = candidate;
             try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (e) { /* */ }
-            // Destination known — tell the injector to unfreeze page variables
-            // so the page (and its next step) computes normally from here on.
             try { window.dispatchEvent(new CustomEvent('killurl-release-vars')); } catch (e) { /* */ }
+
+            // Auto-redirect ONLY if this is a verified authentic final destination and autoRedirect is enabled
+            if (isFinalDest && settings.autoRedirect) {
+                console.log('[KillURL] Auto-redirecting to final destination now:', destinationUrl);
+                try {
+                    window.location.href = destinationUrl;
+                } catch (e) { /* ignore */ }
+            }
             return true;
         }
         return false;
     }
 
     function findDestinationUrl() {
-        // 1. Known selector patterns (check ALL matches, prefer visible)
+        // If countdown is actively ticking, do not harvest premature destination links
+        if (countdownIsLive()) return;
+
+        // 1. Known selector patterns (check visible and ready elements only)
         const seen = new Set();
         for (const selector of DESTINATION_SELECTORS) {
             try {
                 document.querySelectorAll(selector).forEach(el => {
                     if (seen.has(el)) return;
                     seen.add(el);
+                    if (!isVisible(el) || el.disabled) return;
+                    if (!isSafeToClick(el)) return;
                     const href = el.getAttribute('href') || el.dataset?.url || el.dataset?.href ||
                         el.dataset?.link || el.dataset?.redirect || el.dataset?.target;
-                    if (href && setDestination(href)) return;
+                    if (href && !isErrorDestination(href) && setDestination(href)) return;
                 });
                 if (destinationUrl) return;
             } catch (e) { /* skip */ }
@@ -1457,8 +2647,11 @@
         // 2. Text-based link scan (smart CTA matcher)
         const allLinks = document.querySelectorAll('a[href]');
         for (const link of allLinks) {
+            if (!isVisible(link) || link.disabled) continue;
+            if (!isSafeToClick(link)) continue;
             const href = link.getAttribute('href');
             if (!href || href === '#' || href.startsWith('javascript:')) continue;
+            if (isErrorDestination(href)) continue;
 
             const text = ((link.textContent || '') + ' ' + (link.getAttribute('aria-label') || '')).trim();
             if (!text) continue;
@@ -1470,7 +2663,7 @@
         try {
             document.querySelectorAll('form[action]').forEach(form => {
                 const action = form.getAttribute('action');
-                if (action && action !== '#' && setDestination(action)) return;
+                if (action && action !== '#' && !isErrorDestination(action) && setDestination(action)) return;
             });
             if (destinationUrl) return;
         } catch (e) { /* ignore */ }
@@ -1481,11 +2674,11 @@
                 const onclick = el.getAttribute('onclick') || '';
                 if (onclick) {
                     const m = onclick.match(/https?:\/\/[^'"()\s]+/i);
-                    if (m && setDestination(m[0])) return;
+                    if (m && !isErrorDestination(m[0]) && setDestination(m[0])) return;
                 }
                 const d = el.dataset || {};
                 for (const key of ['url', 'href', 'link', 'redirect', 'target', 'destination', 'next']) {
-                    if (d[key] && setDestination(d[key])) return;
+                    if (d[key] && !isErrorDestination(d[key]) && setDestination(d[key])) return;
                 }
             });
             if (destinationUrl) return;
@@ -1513,7 +2706,7 @@
                     if (/^[A-Za-z0-9+/=]+$/.test(url) && url.length > 20 && !url.includes('://')) {
                         try { url = atob(url); } catch (e) { /* */ }
                     }
-                    if (url && url.startsWith('http') && setDestination(url)) return;
+                    if (url && url.startsWith('http') && !isErrorDestination(url) && setDestination(url)) return;
                 }
             }
         }
@@ -1570,6 +2763,7 @@
 
             if (matchesCTA(text) && !isVisible(el)) {
                 if (isProtectedWidget(el)) return;
+                enforceSameTabTarget(el);
                 forceShow(el);
                 // Walk up parents
                 let parent = el.parentElement;
@@ -1590,6 +2784,7 @@
 
             if (matchesCTA(text)) {
                 if (isProtectedWidget(el)) return;
+                enforceSameTabTarget(el);
                 if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
                     el.disabled = false;
                     el.removeAttribute('aria-disabled');
@@ -1618,7 +2813,7 @@
                     const urlMatch = onclick.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i) ||
                         onclick.match(/location\.replace\(['"]([^'"]+)['"]\)/i) ||
                         onclick.match(/window\.open\(['"]([^'"]+)['"]/);
-                    if (urlMatch && urlMatch[1]) {
+                    if (urlMatch && urlMatch[1] && !isErrorDestination(urlMatch[1])) {
                         // Preserve the URL as href so direct navigation works
                         if (el.tagName === 'A' && (!el.getAttribute('href') || el.getAttribute('href') === '#' || el.getAttribute('href') === 'javascript:void(0)')) {
                             el.setAttribute('href', urlMatch[1]);
@@ -1635,6 +2830,10 @@
     }
 
     function removeOverlays() {
+        // Click-ads instruction modals + watch-ad gates first (they gate the
+        // whole step; full interference allowed here — skip-flow context).
+        try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
+        try { handleAdGateOverlays({ aggressive: true }); } catch (e) { /* ignore */ }
         const overlaySelectors = [
             '#overlay', '.overlay', '#ad-overlay', '.ad-overlay',
             '.modal-backdrop', '#modal-backdrop',
@@ -1659,6 +2858,494 @@
         document.documentElement.style.setProperty('overflow', 'auto', 'important');
     }
 
+    // "Click ads, wait & come back" instruction modals (SweetAlert-style
+    // overlays with a dimmed backdrop). These are NOT adblock walls — they
+    // demand a ritual: click an ad image, wait ~15s, return for Get Link.
+    // Text signatures in English + Hindi (as seen on earn-blog templates).
+    const RITUAL_MODAL_PATTERNS = [
+        /click\s*(image|ads?)\s*(&|and)?\s*wait/i,
+        /wait\s*&\s*(back|come\s*back)/i,
+        /click\s*ads\s*wait/i,
+        /come\s*back.*(get\s*link|download)/i,
+        /get\s*link\s*-\s*download/i,
+        /फोटो पर क्लिक/i,
+        /सेकंड रुकें/i,
+        /वापस आएं/i,
+        /LINK पाने/i,
+    ];
+
+    function matchesRitualText(text) {
+        if (!text) return false;
+        for (const p of RITUAL_MODAL_PATTERNS) {
+            if (p.test(text)) return true;
+        }
+        return false;
+    }
+
+    // Is this element a modal close control? × glyphs always count; text/class
+    // matches only count on non-navigating elements (never hijack a real link).
+    function looksLikeClose(c) {
+        try {
+            if (!c || c.nodeType !== 1) return false;
+            const label = ((c.textContent || '') + ' ' + (c.getAttribute('aria-label') || '') + ' ' + (c.getAttribute('alt') || '') + ' ' + (c.getAttribute('title') || '')).trim();
+            const cls = ((c.className && c.className.baseVal !== undefined ? c.className.baseVal : c.className) || '').toString().toLowerCase();
+            if (/^[×✕✖❌✗×]+$/.test(label)) return true;
+            const href = (c.getAttribute && c.getAttribute('href')) || '';
+            const isNavLink = /^https?:/i.test(href);
+            if (/close|dismiss/.test(cls) && !isNavLink) return true;
+            if (/^(close|dismiss|cancel)$/i.test(label) && !isNavLink) return true;
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    // Find a modal's close control: inside it, then its parent, then siblings
+    // (template X buttons often sit OUTSIDE the white box), then by screen
+    // position near the modal's top-right corner.
+    function findCloseControl(modalEl) {
+        try {
+            const scopes = [modalEl];
+            try {
+                const parent = modalEl.parentElement;
+                if (parent && parent !== document.body && parent !== document.documentElement) {
+                    scopes.push(parent);
+                    for (const sib of parent.children) {
+                        if (sib !== modalEl && !modalEl.contains(sib)) scopes.push(sib);
+                    }
+                }
+            } catch (e) { /* ignore */ }
+            for (const scope of scopes) {
+                let found = null;
+                try {
+                    const controls = scope.querySelectorAll('button, a, [role="button"], span, div, i, img, svg');
+                    for (const c of controls) {
+                        if (c === modalEl) continue;
+                        if (looksLikeClose(c) && !isProtectedWidget(c)) { found = c; break; }
+                    }
+                } catch (e) { /* ignore */ }
+                if (found) return found;
+            }
+        } catch (e) { /* ignore */ }
+        return findCloseByPosition(modalEl);
+    }
+
+    function findCloseByPosition(modalEl) {
+        try {
+            const r = modalEl.getBoundingClientRect?.();
+            if (!r || r.width === 0 || r.height === 0) return null;
+            const pts = [
+                [r.right - 14, r.top - 28],
+                [r.right + 6, r.top - 10],
+                [r.right - 14, r.top - 8],
+                [r.right - 44, r.top - 28]
+            ];
+            for (const [x, y] of pts) {
+                if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+                let stack = [];
+                try { stack = document.elementsFromPoint(x, y); } catch (e) { continue; }
+                for (const s of stack) {
+                    if (s === document.body || s === document.documentElement) break;
+                    const label = ((s.textContent || '') + ' ' + (s.getAttribute?.('aria-label') || '')).trim();
+                    if (/^[×✕✖❌✗×]+$/.test(label) && !isProtectedWidget(s)) return s;
+                }
+            }
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    let lastModalSweep = 0;
+    let ritualClickDone = false;
+
+    // Dismiss click-ads instruction modals. Modes:
+    //  - xOnly (watcher/iframe/patient): press the modal's own X and clean up
+    //    its backdrop — a pure user-equivalent action, DOM otherwise untouched.
+    //  - aggressive (skip flows): additionally remove closeless modals.
+    // Afterwards (non-xOnly), attempt the ritual click itself on a SAFE target
+    // (new-tab or JS-handled — never a plain same-tab link, which would
+    // navigate away from the step): inline handlers still run, so
+    // cookie/timestamp unlocks get satisfied without opening ad tabs by hand.
+    // Returns number of modals dismissed.
+    function dismissInstructionModals(opts) {
+        const aggressive = !!(opts && opts.aggressive) && !(opts && opts.xOnly);
+        const xOnly = !!(opts && opts.xOnly);
+        const force = !!(opts && opts.force);
+        try {
+            if (!isEnabled()) return 0;
+            if (isProtectedSite || isFinalSite) return 0;
+            // Explicit user clicks bypass the sweep throttle; background
+            // sweeps stay throttled.
+            if (!force && Date.now() - lastModalSweep < 3000) return 0;
+            // Cheap pre-check: no ritual wording anywhere → nothing to do.
+            const bodyText = document.body?.innerText || '';
+            if (!matchesRitualText(bodyText)) return 0;
+            lastModalSweep = Date.now();
+
+            const seen = new Set();
+            const candidates = [];
+            const collect = (el) => {
+                if (!el || el.nodeType !== 1 || seen.has(el)) return;
+                seen.add(el);
+                if (isProtectedWidget(el)) return;
+                candidates.push(el);
+            };
+            try {
+                document.querySelectorAll(
+                    '.swal-modal, .swal-overlay, [role="dialog"], .modal, [class*="modal"], [id*="modal"], ' +
+                    '[class*="popup"], [class*="swal"], [class*="overlay"], [class*="backdrop"], .popup, .overlay'
+                ).forEach(collect);
+            } catch (e) { /* ignore */ }
+            // Fixed/absolute-position containers (catch-all for custom modals).
+            try {
+                document.querySelectorAll('div, section, aside').forEach(el => {
+                    if (seen.has(el)) return;
+                    let pos = '';
+                    try { pos = window.getComputedStyle(el).position; } catch (e) { return; }
+                    if ((pos === 'fixed' || pos === 'absolute' || pos === 'sticky') && (el.textContent || '').length > 0) collect(el);
+                });
+            } catch (e) { /* ignore */ }
+
+            let dismissed = 0;
+            for (const el of candidates) {
+                let text = '';
+                try { text = (el.innerText || el.textContent || '').slice(0, 600); } catch (e) { continue; }
+                if (!matchesRitualText(text)) continue;
+
+                // Capture ritual ad links BEFORE touching the modal.
+                let ritualLinks = [];
+                try {
+                    ritualLinks = [...el.querySelectorAll('a[href]')].filter(a => {
+                        const href = a.getAttribute('href') || '';
+                        return href && href !== '#' && !href.startsWith('javascript:');
+                    });
+                } catch (e) { /* ignore */ }
+
+                // 1. Press its own close control (exactly what the user does).
+                let closed = false;
+                try {
+                    const closer = findCloseControl(el);
+                    if (closer) {
+                        // Routed through the guarded press: an ad-network × is
+                        // often itself a new-tab opener.
+                        try { dispatchFullClickSequence(closer); } catch (e) { /* ignore */ }
+                        closed = true;
+                    }
+                } catch (e) { /* ignore */ }
+
+                // 2. No close control: only remove in aggressive mode. In
+                // patient/xOnly mode we leave the DOM untouched (anti-bypass
+                // scripts watch for exactly these mutations).
+                if (!closed && aggressive) {
+                    try {
+                        const stillThere = document.contains(el);
+                        el.remove();
+                        closed = stillThere;
+                    } catch (e) { /* ignore */ }
+                }
+                if (!closed) continue;
+
+                dismissed++;
+                console.log('[KillURL] Dismissed click-ads instruction modal');
+                // NOTE: the ritual click happens below, independent of close
+                // success (a closeless modal's links are its only way forward).
+            }
+
+            // Ritual click: independent of whether anything closed. Pressing
+            // the ad target in place is user-equivalent in every mode (no DOM
+            // removal involved) — and for closeless modals it is the ONLY way
+            // forward. Watcher/iframe sweeps (xOnly) skip it.
+            if (!xOnly) {
+                try {
+                    // Re-collect: the modal above may have been removed already.
+                    const links = [];
+                    try {
+                        document.querySelectorAll('.swal-modal a[href], [role="dialog"] a[href], .modal a[href]').forEach(a => {
+                            const href = a.getAttribute('href') || '';
+                            if (href && href !== '#' && !href.startsWith('javascript:') && !links.includes(a)) links.push(a);
+                        });
+                    } catch (e) { /* ignore */ }
+                    if (links.length) attemptRitualClick(links);
+                    else attemptRitualClick(null); // page-level image-link fallback inside
+                } catch (e) { /* ignore */ }
+            }
+
+            if (dismissed > 0) {
+                // Backdrops left behind by the dismissed modal(s).
+                try {
+                    document.querySelectorAll('.modal-backdrop, .swal-overlay, [class*="backdrop"], .fade.show').forEach(bd => {
+                        try {
+                            if (isProtectedWidget(bd)) return;
+                            const t = (bd.textContent || '').trim();
+                            if (t.length > 120) return; // real content, not a dim layer
+                            bd.remove();
+                        } catch (e) { /* ignore */ }
+                    });
+                } catch (e) { /* ignore */ }
+                // Restore scrolling the modal may have locked.
+                try {
+                    document.body.style.setProperty('overflow', 'auto', 'important');
+                    document.documentElement.style.setProperty('overflow', 'auto', 'important');
+                    document.body.classList.remove('modal-open', 'no-scroll', 'swal-open', 'popup-open', 'overflow-hidden');
+                    document.documentElement.classList.remove('modal-open', 'overflow-hidden');
+                } catch (e) { /* ignore */ }
+            }
+            return dismissed;
+        } catch (e) { return 0; }
+    }
+
+    // Perform the "click the ad image" half of the ritual WITHOUT opening ad
+    // tabs by hand: a synthetic press still runs the page's inline handlers,
+    // so cookie/timestamp unlocks get satisfied. Only SAFE targets: new-tab
+    // links or JS-handled controls. Plain same-tab links are never touched
+    // (clicking those would navigate away from the step = chain broken).
+    function attemptRitualClick(modalLinks) {
+        try {
+            if (ritualClickDone) return false;
+            if (!isEnabled()) return false;
+            if (isProtectedSite || isFinalSite) return false;
+            if (isSecurityPage && !settings.aggressiveMode) return false;
+
+            const pool = [];
+            (modalLinks || []).forEach(a => { if (a && document.contains(a)) pool.push(a); });
+            // Page-level fallback: the ritual image usually lives in the post
+            // (the modal itself is often text-only, as in the report).
+            try {
+                document.querySelectorAll('a[href] img').forEach(img => {
+                    const a = img.closest('a[href]');
+                    if (a && !pool.includes(a)) pool.push(a);
+                });
+            } catch (e) { /* ignore */ }
+
+            for (const a of pool) {
+                let href = '';
+                try { href = a.getAttribute('href') || ''; } catch (e) { continue; }
+                if (!href || href === '#') continue;
+                const target = (a.getAttribute('target') || '').toLowerCase();
+                const onclick = a.getAttribute('onclick') || '';
+                const isJsHandled = !!onclick || href.startsWith('javascript:');
+                const opensInNewTab = isNewTabTarget(target);
+                // Skip plain same-tab navigations — chain-breaking risk.
+                if (!opensInNewTab && !isJsHandled) continue;
+                if (isProtectedWidget(a)) continue;
+                try { a.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* ignore */ }
+                try { clearPointBlockers(a); } catch (e) { /* ignore */ }
+                dispatchFullClickSequence(a);
+                ritualClickDone = true;
+                console.log('[KillURL] Ritual ad-click attempted (inline handlers run, no manual ad tab needed)');
+                return true;
+            }
+        } catch (e) { /* ignore */ }
+        return false;
+    }
+
+    // Standalone ritual/ad-gate watcher: independent of skip flows, autopilot
+    // and waiter. Watches the DOM for click-ads instruction modals and
+    // watch-ad gates appearing at ANY time — pressing their own X/Continue is
+    // user-equivalent (never removal, never ad clicks here). The text
+    // pre-checks mean it is a no-op on ordinary pages.
+    let ritualWatcher = null;
+    function watchRitualModals() {
+        if (ritualWatcher) return;
+        try {
+            if (!document.documentElement) {
+                // document_start race: retry once the DOM exists.
+                document.addEventListener('DOMContentLoaded', () => {
+                    try { watchRitualModals(); } catch (e) { /* ignore */ }
+                    try { dismissInstructionModals({ aggressive: false, xOnly: true }); } catch (e) { /* ignore */ }
+                    try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+                }, { once: true });
+                return;
+            }
+            ritualWatcher = new MutationObserver(() => {
+                try { dismissInstructionModals({ aggressive: false, xOnly: true }); } catch (e) { /* ignore */ }
+                try { handleAdGateOverlays(); } catch (e) { /* ignore */ }
+            });
+            ritualWatcher.observe(document.documentElement, { childList: true, subtree: true });
+        } catch (e) { /* ignore */ }
+    }
+
+    // Always-on wall remover, tied to the "Auto-Remove Ad Walls" toggle. The
+    // old implementation only fired 4 fixed timeouts after load and only knew
+    // adblock wording — so late-appearing walls, ritual modals and ad-gates
+    // sat forever while the toggle was ON. This watcher instead sweeps ALL
+    // three wall species whenever the DOM changes (throttled), for as long as
+    // the page lives. Text-gated throughout: a no-op on ordinary pages.
+    let wallWatcher = null;
+    let lastWallSweep = 0;
+    // full=false (iframes): adblock-text walls only — no modal removal, no
+    // ritual/ad-gate presses from inside a frame (a synthetic press there
+    // could escape the frame via target=_top or window.top navigation).
+    function sweepAllWalls(full) {
+        if (!isEnabled()) return 0;
+        if (isProtectedSite || isFinalSite) return 0;
+        if (!settings.removeAdBlockWalls) return 0;
+        if (Date.now() - lastWallSweep < 4000) return 0;
+        lastWallSweep = Date.now();
+        let n = 0;
+        try { n += removeAdBlockWalls() || 0; } catch (e) { /* ignore */ }
+        if (full === false) return n;
+        try { n += dismissInstructionModals({ aggressive: true, force: true }) || 0; } catch (e) { /* ignore */ }
+        try { n += handleAdGateOverlays({ aggressive: true, force: true }) || 0; } catch (e) { /* ignore */ }
+        return n;
+    }
+    function watchAdBlockWalls(opts) {
+        if (wallWatcher) return;
+        const full = !(opts && opts.iframe);
+        try {
+            if (!document.documentElement) {
+                document.addEventListener('DOMContentLoaded', () => {
+                    try { watchAdBlockWalls(opts); } catch (e) { /* ignore */ }
+                    try { sweepAllWalls(full); } catch (e) { /* ignore */ }
+                }, { once: true });
+                return;
+            }
+            console.log('[KillURL] Auto wall remover armed (adblock walls + ritual modals + ad gates)');
+            wallWatcher = new MutationObserver(() => {
+                try { sweepAllWalls(full); } catch (e) { /* ignore */ }
+            });
+            wallWatcher.observe(document.documentElement, {
+                childList: true, subtree: true,
+                attributes: true, attributeFilter: ['style', 'class', 'hidden']
+            });
+            try { sweepAllWalls(full); } catch (e) { /* ignore */ }
+        } catch (e) { /* ignore */ }
+    }
+
+    // "Watch an ad to unlock" gate overlays (a third species: neither a
+    // countdown timer nor an adblock wall nor a click-ads modal). Signature:
+    // a full-screen dim overlay demanding you watch an N-second ad, with its
+    // own CONTINUE button. The right move is NOT removal — it's pressing
+    // THEIR continue (the ritual action itself: starts their flow, sets their
+    // cookies), then letting the normal engine take whatever unlocks.
+    const AD_GATE_PATTERNS = [
+        /watch\s*(a\s*)?(\d+\s*)?(second\s*)?ad/i,
+        /unlock the link/i,
+        /click\s*"continue"/i,
+        /watch.*to\s*(unlock|access|continue)/i,
+        /ad\s*ends\s*in/i,
+        /(continue|begin|start)\s*after\s*(the\s*)?ad/i,
+    ];
+
+    function matchesAdGateText(text) {
+        if (!text) return false;
+        for (const p of AD_GATE_PATTERNS) {
+            if (p.test(text)) return true;
+        }
+        return false;
+    }
+
+    // Parse "watch a 10-second ad" → 10. Feeds the deadline machinery
+    // (advertisedWait) so enforced hosts hold the right floor.
+    function parseAdGateDuration(text) {
+        try {
+            const m = String(text || '').match(/watch[^\n]{0,30}?(\d+)\s*-?\s*second/i) ||
+                String(text || '').match(/(\d+)\s*-?\s*second[^\n]{0,20}?ad/i);
+            if (m) {
+                const v = parseInt(m[1], 10);
+                if (v > 0 && v <= 300) return v;
+            }
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    let lastAdGateSweep = 0;
+    function handleAdGateOverlays(opts) {
+        const aggressive = !!(opts && opts.aggressive);
+        const force = !!(opts && opts.force);
+        try {
+            if (!isEnabled()) return 0;
+            if (isProtectedSite || isFinalSite) return 0;
+            if (isSecurityPage && !settings.aggressiveMode) return 0;
+            if (!force && Date.now() - lastAdGateSweep < 5000) return 0;
+            const bodyText = document.body?.innerText || '';
+            if (!matchesAdGateText(bodyText)) return 0;
+            lastAdGateSweep = Date.now();
+
+            const seen = new Set();
+            const candidates = [];
+            const collect = (el) => {
+                if (!el || el.nodeType !== 1 || seen.has(el)) return;
+                seen.add(el);
+                if (isProtectedWidget(el)) return;
+                candidates.push(el);
+            };
+            // Known gate ids first (this report: #adOverlay camelCase).
+            try {
+                document.querySelectorAll('#adOverlay, [id*="adoverlay" i], [class*="adoverlay" i]').forEach(collect);
+            } catch (e) { /* ignore */ }
+            // Full-screen dim layers (the classic gate anatomy).
+            try {
+                document.querySelectorAll('div, section, aside').forEach(el => {
+                    if (seen.has(el)) return;
+                    let pos = '', w = 0, h = 0;
+                    try {
+                        const cs = window.getComputedStyle(el);
+                        pos = cs.position;
+                        w = parseFloat(cs.width) || el.offsetWidth || 0;
+                        h = parseFloat(cs.height) || el.offsetHeight || 0;
+                    } catch (e) { return; }
+                    if ((pos === 'fixed' || pos === 'absolute') && w >= window.innerWidth * 0.8 && h >= window.innerHeight * 0.5) collect(el);
+                });
+            } catch (e) { /* ignore */ }
+
+            let handled = 0;
+            for (const el of candidates) {
+                let text = '';
+                try { text = (el.innerText || el.textContent || '').slice(0, 600); } catch (e) { continue; }
+                if (!matchesAdGateText(text)) continue;
+
+                // Feed the deadline machinery: "watch a 10-second ad" → 10.
+                try {
+                    const dur = parseAdGateDuration(text);
+                    if (dur && (advertisedWait == null || dur > advertisedWait)) {
+                        advertisedWait = dur;
+                        console.log('[KillURL] Ad-gate duration parsed:', dur + 's');
+                    }
+                } catch (e) { /* ignore */ }
+
+                // Find the gate's own action button and press it. The container
+                // already qualified as an ad gate, so its CTA is the ritual.
+                // Never press a plain same-tab anchor (that would navigate the
+                // step away); buttons and new-tab/JS controls are safe.
+                let pressed = false;
+                try {
+                    const btns = el.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+                    for (const b of btns) {
+                        if (!isVisible(b) || b.disabled) continue;
+                        if (isProtectedWidget(b)) continue;
+                        if (!isSafeToClick(b)) continue;
+                        if (b.tagName === 'A') {
+                            const ahref = b.getAttribute('href') || '';
+                            const atarget = (b.getAttribute('target') || '').toLowerCase();
+                            const aonclick = b.getAttribute('onclick') || '';
+                            if (/^https?:/i.test(ahref) && atarget !== '_blank' && !aonclick) continue;
+                        }
+                        const label = ((b.textContent || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+                        if (!/continue|watch|unlock|play|start|proceed|verify|get\s*link/i.test(label)) continue;
+                        try { el.scrollIntoView?.(); } catch (e) { /* ignore */ }
+                        try { clearPointBlockers(b); } catch (e) { /* ignore */ }
+                        dispatchFullClickSequence(b);
+                        pressed = true;
+                        console.log('[KillURL] Ad-gate Continue pressed:', label.slice(0, 50));
+                        break;
+                    }
+                } catch (e) { /* ignore */ }
+
+                // Buttonless gate and nothing to press: remove only when the
+                // caller allows DOM interference.
+                if (!pressed && aggressive) {
+                    try {
+                        if (document.contains(el)) {
+                            el.remove();
+                            pressed = true;
+                            console.log('[KillURL] Ad-gate overlay removed (no action button)');
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+                if (pressed) handled++;
+            }
+            return handled;
+        } catch (e) { return 0; }
+    }
+
     function handleProgressBars() {
         document.querySelectorAll('.progress-bar, [role="progressbar"], .progress').forEach(el => {
             el.style.setProperty('width', '100%', 'important');
@@ -1679,21 +3366,39 @@
     // bind pointerdown/mousedown (faster on mobile, and .click() alone never
     // fires those) — a lone synthetic click is silently ignored there while a
     // real press works. This is the #1 "timer skipped but Continue is dead" cause.
+    // Returns true only if the press actually fired (callers must not count
+    // skipped presses against retry budgets, or loops stall doing nothing).
     function dispatchFullClickSequence(el) {
         try {
+            if (unloading) return false;
+            enforceSameTabTarget(el);
+            if (!isSafeToClick(el)) return false;
+
+            // Never re-press the SAME new-tab opener: each press opens a tab,
+            // so a second press can only ever open a duplicate.
+            if (opensNewTab(el)) {
+                if (!blankPressFresh(el)) return false;
+                noteNewTabPress(el);
+            }
             const rect = el.getBoundingClientRect?.();
             const cx = rect ? rect.left + rect.width / 2 : 0;
             const cy = rect ? rect.top + rect.height / 2 : 0;
             const base = { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, button: 0, buttons: 1 };
             try { el.dispatchEvent(new PointerEvent('pointerover', { ...base, buttons: 0 })); } catch (e) { /* ignore */ }
             try { el.dispatchEvent(new PointerEvent('pointerenter', { ...base, buttons: 0 })); } catch (e) { /* ignore */ }
+            // A tiny mousemove before the press — templates that count
+            // interaction signals expect at least one movement first.
+            try { el.dispatchEvent(new MouseEvent('mousemove', { ...base, clientX: cx + 4, clientY: cy - 3, buttons: 0 })); } catch (e) { /* ignore */ }
             try { el.dispatchEvent(new PointerEvent('pointerdown', base)); } catch (e) { /* ignore */ }
             try { el.dispatchEvent(new MouseEvent('mousedown', base)); } catch (e) { /* ignore */ }
             try { el.focus?.(); } catch (e) { /* ignore */ }
             try { el.dispatchEvent(new PointerEvent('pointerup', { ...base, buttons: 0 })); } catch (e) { /* ignore */ }
             try { el.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 })); } catch (e) { /* ignore */ }
             el.click();
+            suppressAutoPressUntil = Date.now() + 5000;
+            return true;
         } catch (e) { /* ignore */ }
+        return false;
     }
 
     // If an invisible ad/overlay div sits ON TOP of the button (very common on
@@ -1718,47 +3423,52 @@
         } catch (e) { /* ignore */ }
     }
 
-    // Click a CTA and keep re-clicking as its gate opens (timer-gated handlers
-    // ignore early clicks — the click that lands right after the page marks
-    // completion is the one that advances). Capped so we never spam.
+    // Click a CTA with strict single-shot execution to prevent multi-tab cascades.
     function clickWhenReady(el, timeoutMs = 6000) {
-        if (!el || !isSafeToClick(el)) return false;
+        if (!el || !isSafeToClick(el) || unloading) return false;
         try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* ignore */ }
         clearPointBlockers(el);
         const pageHref = window.location.href;
         let clicks = 0;
-        const MAX_CLICKS = 8;
+        const MAX_CLICKS = 1;
+        let observer = null;
+        let poller = null;
+        const cleanup = () => {
+            if (poller) { clearInterval(poller); poller = null; }
+            if (observer) { observer.disconnect(); observer = null; }
+        };
         const doClick = () => {
-            if (!isEnabled()) return;
-            if (clicks >= MAX_CLICKS) return;
-            if (!document.contains(el)) return;
+            if (!isEnabled() || unloading) { cleanup(); return; }
+            if (clicks >= MAX_CLICKS) { cleanup(); return; }
+            if (!document.contains(el)) { cleanup(); return; }
             if (!isSafeToClick(el)) return;
-            clicks++;
-            clearPointBlockers(el);
-            dispatchFullClickSequence(el);
+            if (opensNewTab(el) && !autoPressAllowed()) return;
+            if (dispatchFullClickSequence(el)) {
+                clicks++;
+                cleanup();
+            } else {
+                clearPointBlockers(el);
+            }
         };
         doClick();
+        if (clicks >= MAX_CLICKS) return true;
         try {
-            const observer = new MutationObserver(() => {
-                // Button changed (text/class/disabled) — gate may have opened
+            observer = new MutationObserver(() => {
+                if (clicks >= MAX_CLICKS || unloading) { cleanup(); return; }
                 setTimeout(doClick, 150);
             });
             observer.observe(el, { attributes: true, childList: true, characterData: true, subtree: true });
-            const poller = setInterval(() => {
-                if (!isEnabled()) { clearInterval(poller); observer.disconnect(); return; }
+            poller = setInterval(() => {
+                if (!isEnabled() || unloading || clicks >= MAX_CLICKS || destinationUrl || window.location.href !== pageHref) {
+                    cleanup();
+                    return;
+                }
                 doClick();
                 findDestinationUrl();
-                if (clicks >= MAX_CLICKS || destinationUrl || window.location.href !== pageHref) {
-                    clearInterval(poller);
-                    observer.disconnect();
-                }
             }, 700);
             setTimeout(() => {
-                clearInterval(poller);
-                observer.disconnect();
-                // Nothing advanced (same page, no destination): the gate needs a
-                // real trusted press — tell the user one manual click finishes it.
-                if (isEnabled() && window.location.href === pageHref && !destinationUrl) {
+                cleanup();
+                if (isEnabled() && !unloading && window.location.href === pageHref && !destinationUrl && clicks === 0) {
                     showPageHint('KillURL: timer skipped — click Continue once yourself to proceed');
                 }
             }, timeoutMs);
@@ -1780,11 +3490,41 @@
                 'box-shadow:0 4px 24px rgba(0,0,0,.5);z-index:2147483647;cursor:pointer;';
             div.addEventListener('click', () => div.remove());
             document.documentElement.appendChild(div);
-            setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 9000);
+            try { div._kuT = setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 9000); } catch (e) { /* ignore */ }
+        } catch (e) { /* ignore */ }
+    }
+
+    // Live-update the in-page hint (creates it if missing, refreshes the
+    // 9s auto-remove timer by re-creating when stale). Used for the
+    // gate countdown readout — polled every second, so keep it cheap.
+    function updatePageHint(text) {
+        try {
+            let div = document.getElementById('killurl-hint');
+            if (!div) { showPageHint(text); return; }
+            if (div.textContent !== text) div.textContent = text;
+            // Re-arm the auto-remove timer so a live readout never flickers out.
+            try {
+                if (div._kuT) clearTimeout(div._kuT);
+                div._kuT = setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 9000);
+            } catch (e) { /* ignore */ }
         } catch (e) { /* ignore */ }
     }
 
     function clickContinueButton() {
+        if (!isEnabled()) return false;
+        if (isProtectedSite || isFinalSite) return false;
+        if (isSecurityPage && !settings.aggressiveMode) return false;
+        if (isCaptchaPending()) {
+            console.log('[KillURL] Captcha / Turnstile pending — waiting for completion before clicking');
+            return false;
+        }
+
+        // If countdown is actively ticking down, do not click prematurely!
+        if (countdownIsLive()) {
+            console.log('[KillURL] Countdown is actively ticking — waiting for completion before clicking');
+            return false;
+        }
+
         // Site-specific handlers
         const hostname = window.location.hostname.replace(/^www\./, '').toLowerCase();
 
@@ -1804,9 +3544,10 @@
             '#getlink', '.getlink', 'a#getlink', 'a.getlink',
             '#btn-main', '.btn-main', 'a#btn-main', 'a.btn-main',
             '#land-btn', '.land-btn',
-            '#wpsafe-link a', '.wpsafe-link a',
-            '#wpsafe-generate a',
-            '#download a', '.download a',
+            '#wpsafe-link a', '#wpsafe-link button', '#wpsafe-link',
+            '.wpsafe-link a', '.wpsafe-link button', '.wpsafe-link',
+            '#wpsafe-generate a', '#wpsafe-generate button', '#wpsafe-generate',
+            '#wpsafe-wait a', '#wpsafe-wait button',
             '#scroll-to-continue', '.scroll-to-continue',
             '#continue-btn', '.continue-btn',
             '#skip-btn', '.skip-btn',
@@ -1847,6 +3588,7 @@
     // Step 2: After clicking "Get Link" → "Continue" button appears
     function clickEarnboxButton() {
         if (!isEnabled()) return false;
+        if (!autoPressAllowed()) return false;
         console.log('[KillURL] earnbox.in: Looking for buttons (Get Link or Continue)...');
         
         // Strategy 1: Look for buttons/links with specific text patterns (check hidden ones too)
@@ -1867,7 +3609,8 @@
                     depth++;
                 }
                 setTimeout(() => {
-                    el.click();
+                    if (!autoPressAllowed()) return;
+                    dispatchFullClickSequence(el);
                     console.log('[KillURL] earnbox.in: Clicked "Get Link", waiting for Continue button...');
                     // After clicking Get Link, wait and look for Continue button
                     setTimeout(() => {
@@ -1917,7 +3660,8 @@
                 depth++;
             }
             setTimeout(() => {
-                btn.click();
+                if (!autoPressAllowed()) return;
+                dispatchFullClickSequence(btn);
                 console.log('[KillURL] earnbox.in: Clicked button, checking for next step...');
                 // Wait and check if there's another button to click
                 setTimeout(() => {
@@ -1949,10 +3693,11 @@
                     depth++;
                 }
                 setTimeout(() => {
+                    if (!autoPressAllowed()) return;
                     if (href && href !== '#' && !href.startsWith('javascript:')) {
                         navigateOrClick(el);
                     } else {
-                        el.click();
+                        dispatchFullClickSequence(el);
                         // Wait and check for next step
                         setTimeout(() => {
                             clickEarnboxButton();
@@ -1995,24 +3740,46 @@
             if (urlMatch) href = urlMatch[1];
         }
 
-        // If the CTA is (or wraps) a real link to another page, navigate
-        // directly — this bypasses timer-gated and isTrusted-gated click
-        // handlers entirely. Direct jumps need consent (canAutoAct): without
-        // it we only press the button in place, never leave the page.
-        // Pure-JS buttons fall through to gated clicking.
-        if (href && (href.startsWith('http') || href.startsWith('/')) && isValidDestination(href) && canAutoAct()) {
-            console.log('[KillURL] Navigating directly via CTA href:', href);
-            window.location.href = href;
-            // Still click (capped) in case navigation is intercepted
-            setTimeout(() => { clickWhenReady(el, 3000); }, 300);
+        // Strip error href if present so clicking won't follow error page
+        if (href && isErrorDestination(href)) {
+            try { el.removeAttribute('href'); } catch (e) { /* ignore */ }
             return;
         }
 
-        // No usable href (timer-gated button like your Continue): click now and
-        // keep re-clicking as the gate opens.
+        // Always enforce same-tab target to prevent new tab explosions
+        enforceSameTabTarget(el);
+
+        // Always click the element first so page event handlers,
+        // AJAX token fetches, form submissions, and analytics/session updates run naturally!
+        console.log('[KillURL] Clicking CTA element:', (el.textContent || el.value || el.id || el.className || 'button').trim().slice(0, 60));
+        unloading = true;
+        suppressAutoPressUntil = Date.now() + 15000;
+        const navFrom = window.location.href;
         setTimeout(() => {
-            clickWhenReady(el);
-        }, 200);
+            try {
+                if (window.location.href === navFrom) unloading = false;
+            } catch (e) { unloading = false; }
+        }, 8000);
+
+        dispatchFullClickSequence(el);
+
+        // If clicking did not trigger navigation after a settle window,
+        // and el is a genuine external link (not javascript/hash), navigate as fallback
+        if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('/')) && isValidDestination(href)) {
+            let resolved = href;
+            try { resolved = new URL(href, window.location.href).href; } catch (e) { /* keep raw */ }
+            if (!isErrorDestination(resolved) && resolved !== window.location.href) {
+                setTimeout(() => {
+                    try {
+                        if (!unloading || window.location.href === navFrom) {
+                            console.log('[KillURL] Fallback direct navigation via CTA href:', resolved);
+                            unloading = true;
+                            window.location.href = resolved;
+                        }
+                    } catch (e) { /* ignore */ }
+                }, 1200);
+            }
+        }
     }
 
     // ===== UTILITIES =====
@@ -2031,13 +3798,61 @@
         }
     }
 
+    // Ad/tracker hosts are NEVER destinations: capturing (or, worse,
+    // navigating to) a "Click here" ad link is how chains derail into ad
+    // loops and how false arrivals poison loop memory. Mirrors the injector's
+    // bait list; host-focused so first-party links are never affected.
+    const AD_HOST_RE = /googlesyndication|googleadservices|doubleclick|googletagservices|adservice\.google|pagead|adsbygoogle|adsrvr|adnxs|criteo|taboola|outbrain|revcontent|mgid|amazon-adsystem|apstag|pubmatic|rubicon|moatads|2mdn\.net|prebid|pbjs|popads|adform\.net|propellerads|adsterra|exoclick|adcash|popcash|clickadu/i;
+
+    function isAdHost(url) {
+        try {
+            return AD_HOST_RE.test(new URL(url, window.location.href).hostname);
+        } catch (e) { return false; }
+    }
+
+    const ERROR_DEST_RE = /(?:error\.php|\berrno=\d+|\borigin=download|\berror_code=\d+|\b(?:404|403|500)\.html?|\/404(?:\/|\.|$|\?)|bypass\.vip|discord\.(?:gg|com)|(?:invalid[_-]?token|session[_-]?expired|token[_-]?expired|link[_-]?expired|blocked|suspended|cheating))/i;
+
+    function isErrorDestination(url) {
+        if (!url) return true;
+        const sites = window.KILLURL_SITES || (typeof globalThis !== 'undefined' ? globalThis.KILLURL_SITES : null);
+        if (sites && typeof sites.isErrorUrl === 'function') {
+            return sites.isErrorUrl(url);
+        }
+        try {
+            const s = String(url).trim();
+            if (ERROR_DEST_RE.test(s)) return true;
+            const u = new URL(s, window.location.href);
+            const host = u.hostname.replace(/^www\./, '').toLowerCase();
+            const full = u.pathname + u.search + u.hash;
+            if (host === 'mediafire.com' || host.endsWith('.mediafire.com')) {
+                if (/(?:error\.php|\berrno=\d+|\borigin=download|upgrade_support\.php|terms_of_service)/i.test(full)) return true;
+                return !(/\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]{4,}|\/\?[a-zA-Z0-9_-]{5,}/i.test(full));
+            }
+            if (host === 'mega.nz' || host === 'mega.io') {
+                return !(/\/(?:file|folder)\/[a-zA-Z0-9_-]{6,}|#[!a-zA-Z0-9_-]{8,}/i.test(full));
+            }
+            if (host === 'drive.google.com') {
+                return !(/\/(?:file\/d\/|drive\/folders\/|open\?id=|uc\?id=)[a-zA-Z0-9_-]{10,}/i.test(full));
+            }
+            return false;
+        } catch (e) {
+            return true;
+        }
+    }
+
     function isValidDestination(url) {
         if (!url) return false;
         url = url.trim();
+        if (isErrorDestination(url)) return false;
         if (url.startsWith('/go/') || url.startsWith('/out/') || url.startsWith('/redirect/') || url.startsWith('/link/')) return true;
         if (!url.startsWith('http://') && !url.startsWith('https://')) return false;
+        if (isAdHost(url)) return false;
         try {
-            const destHost = new URL(url).hostname.replace(/^www\./, '');
+            const u = new URL(url);
+            // Avatar/profile images are page furniture, never destinations.
+            const hn = u.hostname.replace(/^www\./, '').toLowerCase();
+            if (/^(secure\.)?gravatar\.com$|libravatar|robohash|ui-avatars|pravatar/i.test(hn)) return false;
+            const destHost = u.hostname.replace(/^www\./, '');
             const currentHost = window.location.hostname.replace(/^www\./, '');
             return destHost !== currentHost;
         } catch (e) {
@@ -2052,6 +3867,10 @@
         mutationObserverAttached = true;
         const observer = new MutationObserver((mutations) => {
             if (!isEnabled()) return;
+            if (isProtectedSite || isFinalSite) return;
+
+            checkCaptchaResolution();
+
             if (isSecurityPage && !settings.aggressiveMode) return;
 
             let shouldScan = false;
@@ -2059,9 +3878,8 @@
                 if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                     for (const node of mutation.addedNodes) {
                         if (node.nodeType === Node.ELEMENT_NODE) {
-                            // Check if CF challenge was injected after load
-                            const html = node.innerHTML || '';
-                            if (html.includes('cf-challenge') || html.includes('cf-turnstile') || html.includes('challenge-platform')) {
+                            // Check if interstitial CF challenge was injected after load
+                            if (isInterstitialSecurityPage()) {
                                 isSecurityPage = true;
                                 if (!settings.aggressiveMode) {
                                     stopContinuousScanner();
@@ -2069,10 +3887,19 @@
                                 }
                             }
 
+                            // If turnstile or captcha was injected after load, notify injector to stand down
+                            const html = node.innerHTML || '';
+                            const src = (node.src || node.getAttribute?.('src') || '').toLowerCase();
+                            if (html.includes('challenges.cloudflare.com') || html.includes('turnstile') || src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
+                                try {
+                                    window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'mutation-turnstile' } }));
+                                } catch (e) { /* ignore */ }
+                            }
+
                             const text = (node.textContent || '').toLowerCase();
                             if (text.includes('continue') || text.includes('skip') ||
                                 text.includes('get link') || text.includes('scroll down') ||
-                                text.includes('download') || text.includes('click here')) {
+                                text.includes('download link') || text.includes('click here')) {
                                 shouldScan = true;
                             }
                         }
@@ -2082,11 +3909,14 @@
                 if (mutation.type === 'attributes') {
                     const target = mutation.target;
                     if (mutation.attributeName === 'disabled' || mutation.attributeName === 'style' ||
-                        mutation.attributeName === 'class' || mutation.attributeName === 'href') {
+                        mutation.attributeName === 'class' || mutation.attributeName === 'href' || mutation.attributeName === 'value') {
                         const text = (target.textContent || '').toLowerCase();
                         if (text.includes('continue') || text.includes('skip') ||
                             text.includes('get link') || text.includes('scroll down')) {
                             shouldScan = true;
+                        }
+                        if (target.name === 'cf-turnstile-response' || target.name === 'g-recaptcha-response' || target.name === 'h-captcha-response') {
+                            checkCaptchaResolution();
                         }
                     }
                 }
@@ -2101,7 +3931,7 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['style', 'class', 'disabled', 'href', 'aria-disabled', 'aria-hidden']
+            attributeFilter: ['style', 'class', 'disabled', 'href', 'aria-disabled', 'aria-hidden', 'value']
         });
     }
 
@@ -2232,6 +4062,14 @@
                     sendResponse({ success: false, disabled: true, destinationUrl });
                     break;
                 }
+                if (isProtectedSite) {
+                    sendResponse({ success: false, isProtected: true, destinationUrl });
+                    break;
+                }
+                if (isFinalSite) {
+                    sendResponse({ success: false, isFinal: true, destinationUrl });
+                    break;
+                }
                 // USER explicitly clicked skip
                 executeSkip();
                 sendResponse({
@@ -2244,22 +4082,44 @@
 
             case 'SHORTENER_DETECTED':
                 if (!isEnabled()) { sendResponse({ success: false, disabled: true }); break; }
+                if (isProtectedSite || isFinalSite) { sendResponse({ success: false }); break; }
                 isKnownShortener = true;
                 isShortenerPage = true;
                 if (message.autoSkip) settings.autoSkip = true;
                 if (message.autoRedirect) settings.autoRedirect = true;
                 notifyStatus();
+                // Query remote bypass resolver in parallel
+                try {
+                    chrome.runtime.sendMessage({ type: 'RESOLVE_BYPASS', url: window.location.href }, (resp) => {
+                        if (resp && resp.destination) {
+                            console.log('[KillURL] Remote resolver resolved destination:', resp.destination);
+                            setDestination(resp.destination);
+                        }
+                    });
+                } catch (e) { /* ignore */ }
                 maybeAutoSkip();
+                sendResponse({ success: true });
+                break;
+
+            case 'RESOLVER_FOUND_DESTINATION':
+                if (message.url) {
+                    console.log('[KillURL] Received resolver destination from background:', message.url);
+                    setDestination(message.url);
+                }
                 sendResponse({ success: true });
                 break;
 
             case 'GET_STATUS':
                 sendResponse({
                     enabled: isEnabled(),
-                    arrived: arrivedAtDestination,
+                    arrived: arrivedAtDestination || isFinalSite,
+                    patient: patientMode,
+                    gateInSec: (() => { try { const r = gateRemainingMs(); return r < 0 ? null : Math.ceil(r / 1000); } catch (e) { return null; } })(),
                     isShortenerPage,
                     isKnownShortener,
                     isSecurityPage,
+                    isProtected: isProtectedSite,
+                    isFinal: isFinalSite,
                     aggressiveMode: !!settings.aggressiveMode,
                     countdownDetected,
                     destinationUrl,
@@ -2270,6 +4130,7 @@
 
             case 'DO_REDIRECT':
                 if (!isEnabled()) { sendResponse({ success: false, disabled: true }); break; }
+                if (isProtectedSite) { sendResponse({ success: false, disabled: true }); break; }
                 if (message.url) {
                     window.location.href = message.url;
                 } else if (destinationUrl) {
@@ -2280,7 +4141,19 @@
 
             case 'REMOVE_ADBLOCK_WALL':
                 if (!isEnabled()) { sendResponse({ success: false, disabled: true, removed: 0 }); break; }
-                const wallsRemoved = removeAdBlockWalls();
+                if (isProtectedSite) { sendResponse({ success: false, disabled: true, removed: 0 }); break; }
+                // Manual button = explicit consent: sweep EVERY wall species
+                // (adblock walls, click-ads instruction modals, watch-ad
+                // gates) with throttles bypassed and full removal allowed.
+                // That's why the old code reported "nothing" while a modal
+                // stood in plain sight — it only checked adblock wording.
+                let wallsRemoved = 0;
+                try { wallsRemoved += removeAdBlockWalls() || 0; } catch (e) { /* ignore */ }
+                try { wallsRemoved += dismissInstructionModals({ aggressive: true, force: true }) || 0; } catch (e) { /* ignore */ }
+                try {
+                    const gates = handleAdGateOverlays({ aggressive: true, force: true }) || 0;
+                    wallsRemoved += gates;
+                } catch (e) { /* ignore */ }
                 sendResponse({ success: true, removed: wallsRemoved });
                 break;
 
@@ -2298,13 +4171,49 @@
                     });
                     break;
                 }
+                if (isProtectedSite) {
+                    sendResponse({
+                        enabled: true,
+                        isProtected: true,
+                        isShortenerPage: false,
+                        isKnownShortener: false,
+                        isSecurityPage: false,
+                        countdownDetected: false,
+                        destinationUrl: null,
+                        hostname: window.location.hostname,
+                        scanCount: 0
+                    });
+                    break;
+                }
+                if (isFinalSite) {
+                    sendResponse({
+                        enabled: true,
+                        isFinal: true,
+                        arrived: true,
+                        isShortenerPage: false,
+                        isKnownShortener: false,
+                        isSecurityPage: false,
+                        countdownDetected: false,
+                        destinationUrl: null,
+                        hostname: window.location.hostname,
+                        scanCount: 0
+                    });
+                    break;
+                }
                 isShortenerPage = false;
                 countdownDetected = false;
                 countdownGunSeen = false;
                 destinationUrl = null;
+                skipRetriesScheduled = false;
                 isSecurityPage = false;
                 scanCount = 0;
-                try { maybeAutoSkip._withheldLogged = false; } catch (e) { /* ignore */ }
+                try {
+                    maybeAutoSkip._withheldLogged = false;
+                    countHistory = [];
+                    everSawLiveCountdown = false;
+                    firstSignalT = 0;
+                    firstPositiveT = 0;
+                } catch (e) { /* ignore */ }
 
                 // Re-check security
                 if (checkSecurityPage() || checkSecurityPageDOM()) {
@@ -2323,6 +4232,8 @@
                         isShortenerPage,
                         isKnownShortener,
                         isSecurityPage,
+                        isProtected: isProtectedSite,
+                        isFinal: isFinalSite,
                         countdownDetected,
                         destinationUrl,
                         hostname: window.location.hostname,
@@ -2358,6 +4269,17 @@
                 // State values (aggressive/DRM) may still have changed — keep the
                 // injector in sync without restarting detection.
                 broadcastStatesToInjector();
+                // Toggle flipped on with the page already open: arm the wall
+                // watcher now instead of waiting for a reload. Frames get the
+                // walls-only sweep (never modal removal or ad presses).
+                if (settings.removeAdBlockWalls) {
+                    let framed = false;
+                    try { framed = window.self !== window.top; } catch (e) { framed = true; }
+                    try {
+                        if (framed) { watchAdBlockWalls({ iframe: true }); sweepAllWalls(false); }
+                        else { watchAdBlockWalls(); sweepAllWalls(true); }
+                    } catch (e) { /* ignore */ }
+                }
             }
         });
     }
@@ -2383,7 +4305,7 @@
     function retryInjectorSetup() {
         try {
             const pageWindow = typeof window.wrappedJSObject !== 'undefined' ? window.wrappedJSObject : window;
-            if (!pageWindow.__killurl_injector_loaded) {
+            if (!pageWindow.__k7_ld) {
                 ensureInjectorLoaded();
             }
         } catch (e) { /* ignore */ }
@@ -2396,5 +4318,11 @@
     window.addEventListener('load', retryInjectorSetup);
 
     // Initialize
+    // Unmissable boot heartbeat (always-on, not debug-gated): if this line
+    // never appears, the content script isn't running here at all (extension
+    // not reloaded/disabled, or page excluded) — check chrome://extensions.
+    try {
+        console.log('[KillURL] content v1.4.0 loaded @ ' + window.location.hostname);
+    } catch (e) { /* ignore */ }
     init();
 })();

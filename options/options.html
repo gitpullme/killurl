@@ -198,6 +198,14 @@
                         <textarea id="customSites" class="textarea-input" rows="5"
                             placeholder="example.com&#10;another-shortener.net&#10;mysite.io"></textarea>
                     </div>
+
+                    <div class="setting-row column">
+                        <div class="setting-info full">
+                            <h3>Server-Side Timer Bypass Engine</h3>
+                            <p>Sites where server-side timer enforcement is detected. KillURL accelerates client countdowns, backdates form/request timestamp tokens, and applies fast bypass resolvers to skip waits without stalling or bouncing back to step 1.</p>
+                        </div>
+                        <button class="save-btn secondary" id="clearPatientBtn" type="button">Reset bypass cache</button>
+                    </div>
                 </div>
             </section>
 
@@ -236,7 +244,7 @@
 
                 <div class="setting-card">
                     <div class="about-content">
-                        <p><strong>KillURL</strong> <span id="aboutVersion">v1.2.4</span></p>
+                        <p><strong>KillURL</strong> <span id="aboutVersion">v1.4.2</span></p>
                         <p class="muted">Skip countdown timers and bypass URL shortener pages instantly.</p>
                         <p class="muted" style="margin-top: 8px;">The extension works by detecting countdown timers,
                             revealing hidden continue/skip buttons, and finding destination URLs embedded in page
@@ -258,6 +266,7 @@
         </div>
     </div>
 
+    <script src="../shared/sites.js"></script>
     <script src="options.js"></script>
 </body>
 

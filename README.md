@@ -16,6 +16,12 @@ A Chrome extension that instantly bypasses countdown timers on URL shortener pag
 - Navigates directly to the final page — zero waiting
 - Decodes base64-encoded URLs often used by shorteners
 
+### ⚡ Server-Side Timer Bypass Engine
+- Fast-forwards client countdowns without stalling or falling back to 1000ms crawl speeds
+- Automatically ages form tokens and backdates in-flight AJAX/fetch request timestamps (`timer: 0`, `elapsed: 60`, backdated timestamps)
+- Integrates remote bypass resolver API queries in parallel to skip complex multi-step shorteners instantly
+- Immediately auto-redirects to destinations upon detection
+
 ### ⚙️ Smart Detection
 - 70+ supported URL shortener domains built-in
 - Mutation Observer watches for dynamically loaded countdowns

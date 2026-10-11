@@ -1,6 +1,16 @@
 // KillURL Background Service Worker
 // Handles communication between popup, content scripts, and manages state
 
+try {
+    importScripts('/shared/sites.js');
+} catch (e) {
+    try {
+        importScripts('../shared/sites.js');
+    } catch (e2) {
+        console.error('[KillURL] importScripts failed:', e2);
+    }
+}
+
 // Default settings
 const DEFAULT_SETTINGS = {
     enabled: true, // Master on/off switch
@@ -28,20 +38,282 @@ async function getSettings() {
 // must stand down instead of "skipping" the real page. One-shot per tab.
 const lastDestinationByTab = new Map(); // tabId -> destination url string
 
+// Per-tab chain memory for LOOP detection. Earn chains ("Step N of 6") often
+// enforce waits server-side: finishing the client timer instantly gets the
+// token rejected and the server bounces you back to step 1 — an endless loop.
+// Seeing a page for the 2nd time in one tab means exactly that, so we switch
+// that tab to patient mode (wait the timer out naturally, then advance).
+const visitHistoryByTab = new Map(); // tabId -> [{key, t}] (cap 30, 4-min window)
+const patientTabs = new Set(); // tabIds that must wait steps out naturally
+const LOOP_WINDOW_MS = 4 * 60 * 1000; // revisit only counts recent bounces
+
+// HOSTS that have proven to enforce waits server-side (a chain looped there
+// once). Persisted in storage.local with a TTL so EVERY future chain on that
+// host — any tab, any browser session within the TTL — runs patient from its
+// very first page instead of re-learning the lesson by bouncing once per tab.
+// Each entry also carries the LEARNED REQUIRED SECONDS (s): the advertised
+// countdown of the step that bounced (+ margin), so enforced hosts hold the
+// gate until the earliest server-valid instant instead of watching blindly.
+// Experiment fields (the self-calibrating engine):
+//   m: 'unknown' (enforced, strategy untried) | 'malleable' (aged tokens pass
+//      → submit instantly, no floor) | 'strict' (aged tokens rejected →
+//      deadline floor only, never probe again)
+//   b: bounce count observed on this host (drives probe/escalation decisions)
+// Fast Remote Bypass Resolver API
+// Safely queries bypass endpoints and strictly validates destinations
+async function resolveShortenerUrl(shortUrl) {
+    if (!shortUrl || !/^https?:\/\//i.test(shortUrl)) return null;
+    try {
+        const u = new URL(shortUrl);
+        const host = u.hostname.replace(/^www\./, '').toLowerCase();
+        if (typeof KILLURL_SITES !== 'undefined' && (KILLURL_SITES.isProtected(host) || KILLURL_SITES.isFinal(host))) return null;
+        
+        // Note: api.bypass.vip is discontinued (returns promo text) — cleanly fall back to in-page engine
+        return null;
+    } catch (e) {
+        // Fall back to in-page bypass
+    }
+    return null;
+}
+
+// Clean up any legacy learned slow-down records on startup so no site stays trapped in 25-120s waits
+(async () => {
+    try {
+        await chrome.storage.local.remove(LEARNED_PATIENT_STORE);
+        patientTabs.clear();
+        console.log('[KillURL] Cleared legacy slow-down patient store — fast server skip engine active');
+    } catch (e) { /* ignore */ }
+})();
+
+const LEARNED_PATIENT_STORE = 'kuLearnedPatientHosts';
+const LEARNED_PATIENT_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+
+async function getLearnedPatientHosts() {
+    try {
+        const o = await chrome.storage.local.get(LEARNED_PATIENT_STORE);
+        const now = Date.now();
+        return ((o && o[LEARNED_PATIENT_STORE]) || [])
+            .filter(e => e && typeof e.h === 'string' && (now - (e.t || 0)) < LEARNED_PATIENT_TTL_MS);
+    } catch (e) { return []; }
+}
+
+async function learnPatientHost(host, requiredSeconds) {
+    if (!host) return;
+    try {
+        const list = await getLearnedPatientHosts();
+        // Cap required wait to 3-4s max - never lock into 25-120s stalls
+        const s = (typeof requiredSeconds === 'number' && requiredSeconds > 0) ? Math.min(Math.round(requiredSeconds), 4) : 3;
+        const existing = list.find(e => e.h === host);
+        if (existing) {
+            existing.s = s;
+            existing.t = Date.now();
+            existing.b = (existing.b || 0) + 1;
+            existing.m = 'malleable'; // Token aging engine is always active
+        } else {
+            list.push({ h: host, t: Date.now(), s: s, m: 'malleable', b: 1 });
+        }
+        await chrome.storage.local.set({ [LEARNED_PATIENT_STORE]: list.slice(-200) });
+        console.log('[KillURL] Host recorded for fast server-timer bypass:', host, '(max window: ' + s + 's)');
+    } catch (e) { /* ignore */ }
+}
+
+// Experiment verdicts: malleable by default since our active token & net engine bypasses timers
+async function setHostExperiment(host, verdict) {
+    if (!host) return;
+    try {
+        const list = await getLearnedPatientHosts();
+        const existing = list.find(e => e.h === host);
+        if (existing) {
+            existing.m = verdict;
+            existing.t = Date.now();
+        } else {
+            list.push({ h: host, t: Date.now(), s: null, m: verdict, b: 0 });
+        }
+        await chrome.storage.local.set({ [LEARNED_PATIENT_STORE]: list.slice(-200) });
+    } catch (e) { /* ignore */ }
+}
+
+async function getHostExperiment(host) {
+    try {
+        const list = await getLearnedPatientHosts();
+        const e = list.find(x => host === x.h || host.endsWith('.' + x.h));
+        if (!e) return { malleable: true, strict: false, bounces: 0, required: 3 };
+        return {
+            malleable: e.m !== 'strict',
+            strict: false,
+            bounces: e.b || 0,
+            required: Math.min((typeof e.s === 'number' && e.s > 0) ? e.s : 3, 4)
+        };
+    } catch (err) { return null; }
+}
+
+// In-flight malleability probes: tabId -> { host, t }. Set when a content
+// script fires a backdated submit; resolved by the NEXT CHECK_LOOP from the
+// same tab (new step key = probe worked → malleable; revisit = bounced →
+// strict + escalate). Expire after 90s so a stalled page can't leave a
+// permanent armed probe behind.
+const probeByTab = new Map(); // tabId -> { host, t }
+const PROBE_TTL_MS = 90000;
+
+// The advertised countdown of the step currently loaded in a tab (parsed by
+// the content script and reported via PAGE_STATUS). When a bounce lands, THIS
+// is the value of the step that FAILED — the perfect attribution for
+// learning that host's true wait requirement.
+const lastAdvertisedByTab = new Map(); // tabId -> seconds
+
+// Tab state ALSO lives in chrome.storage.session: the service worker sleeps
+// during long countdown waits and wakes up amnesiac — arrival memory and loop
+// history must survive that, or chains randomly regress mid-flow.
+const hasSessionStorage = !!(chrome.storage && chrome.storage.session);
+async function persistTabState() {
+    if (!hasSessionStorage) return;
+    try {
+        const kuTabState = {};
+        const tabIds = new Set([...lastDestinationByTab.keys(), ...visitHistoryByTab.keys(), ...patientTabs, ...lastAdvertisedByTab.keys()]);
+        for (const id of tabIds) {
+            kuTabState[id] = {
+                dest: lastDestinationByTab.get(id) || null,
+                hist: visitHistoryByTab.get(id) || [],
+                patient: patientTabs.has(id),
+                ad: (typeof lastAdvertisedByTab.get(id) === 'number') ? lastAdvertisedByTab.get(id) : null
+            };
+        }
+        await chrome.storage.session.set({ kuTabState });
+    } catch (e) { /* ignore */ }
+}
+async function restoreTabState() {
+    if (!hasSessionStorage) return;
+    try {
+        const s = await chrome.storage.session.get('kuTabState');
+        const all = (s && s.kuTabState) || {};
+        for (const id of Object.keys(all)) {
+            const st = all[id] || {};
+            if (st.dest) lastDestinationByTab.set(Number(id), st.dest);
+            if (Array.isArray(st.hist) && st.hist.length) {
+                // Normalize legacy plain-string entries to {key, t}.
+                const norm = st.hist.map(e => (typeof e === 'string') ? { key: e, t: Date.now() } : e)
+                    .filter(e => e && typeof e.key === 'string');
+                if (norm.length) visitHistoryByTab.set(Number(id), norm.slice(-30));
+            }
+            if (st.patient) patientTabs.add(Number(id));
+            if (typeof st.ad === 'number' && st.ad > 0) lastAdvertisedByTab.set(Number(id), st.ad);
+        }
+    } catch (e) { /* ignore */ }
+}
+
 function hostOf(url) {
     try {
         return new URL(url).hostname.replace(/^www\./, '').toLowerCase();
     } catch (e) { return ''; }
 }
 
+function pathOf(url) {
+    try {
+        const p = new URL(url).pathname || '/';
+        return p.replace(/\/+$/, '') || '/';
+    } catch (e) { return '/'; }
+}
+
+// Arrival test: exact same URL (ignoring #fragment), or the remembered
+// destination path is a prefix of (or equal to) the current page's path.
+// Query strings are ignored on the prefix branch — landing pages routinely
+// gain/lose tracking params on redirect.
+function exactUrlMatch(remembered, current) {
+    try {
+        const noHash = (u) => { const x = new URL(u); x.hash = ''; return x.href; };
+        return noHash(remembered) === noHash(current);
+    } catch (e) { return false; }
+}
+function pathIsPrefixOf(remembered, current) {
+    try {
+        const noHash = (u) => { const x = new URL(u); x.hash = ''; return x.href; };
+        if (noHash(remembered) === noHash(current)) return true;
+        const dp = pathOf(remembered);
+        const cp = pathOf(current);
+        if (dp === '/') return true;
+        return cp === dp || cp.startsWith(dp + '/');
+    } catch (e) { return false; }
+}
+
+function normUrl(url) {
+    try {
+        const u = new URL(url);
+        u.hash = '';
+        return u.href;
+    } catch (e) { return url; }
+}
+
+// Loop key: host + path + step marker so multi-step flows are recognized as forward progress,
+// while repeated bounces to the exact same initial step remain detectable.
+function loopKey(url) {
+    try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^www\./, '').toLowerCase();
+        let path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+        const step = u.searchParams.get('step') || u.searchParams.get('page') || u.searchParams.get('s') || '';
+        return host + path + (step ? '?step=' + step : '');
+    } catch (e) { return url; }
+}
+
+const AD_POPUP_HOST_RE = /popads|popcash|propellerads|adsterra|monetag|clickadu|yllix|hilltopads|exoclick|trafficjunky|juicyads|ero-advertising|richads|adcash|bidvertiser|revenuehits|evadav|admaven|rollerads|onclickmega|highcpmgate|highrevenuegate|al5sm|whomee|dood|streamtape|vupload|syndication|doubleclick|googleadservices|googlesyndication|adnxs|taboola|outbrain|criteo|mgid|revcontent|zeroredirect|offerwall|traffic|direct-link|smartlink|adroute|adlinkfly|linkvertise|loot-link|loot-labs|ad-maven|ad-delivery|delivery-engine|clcksite|tracking|trackclick|xmlclick|adtracker/i;
+
+function isAdPopupUrl(url) {
+    if (!url) return false;
+    try {
+        const u = String(url).trim();
+        if (AD_POPUP_HOST_RE.test(u)) return true;
+        if (/[?&](zoneid|bannerid|campaignid|pubid|direct_link|popunder|popup|clickid|ad_id)=/i.test(u)) return true;
+    } catch (e) { return false; }
+    return false;
+}
+
+const recentShortenerPopupTabs = new Map(); // tabId -> timestamp
+
+if (chrome.tabs?.onCreated) {
+    chrome.tabs.onCreated.addListener(async (tab) => {
+        if (!tab || !tab.id) return;
+        const openerId = tab.openerTabId;
+        if (!openerId) return;
+
+        // Check if opener tab is in shortener memory or currently on a shortener URL
+        let isShortenerOpener = visitHistoryByTab.has(openerId) || patientTabs.has(openerId) || lastDestinationByTab.has(openerId);
+        if (!isShortenerOpener) {
+            try {
+                const openerTab = await chrome.tabs.get(openerId);
+                if (openerTab?.url) {
+                    const h = hostOf(openerTab.url);
+                    if (isKnownShortener(h)) isShortenerOpener = true;
+                }
+            } catch (e) { /* ignore */ }
+        }
+        if (!isShortenerOpener) return;
+
+        const targetUrl = tab.pendingUrl || tab.url || '';
+        if (isAdPopupUrl(targetUrl)) {
+            console.log('[KillURL:BG] Closed rogue ad popup tab:', tab.id, targetUrl.slice(0, 80));
+            try { chrome.tabs.remove(tab.id); } catch (e) { /* ignore */ }
+            return;
+        }
+
+        // If opened from a shortener, track it for 8 seconds so deferred ad navigations are closed
+        recentShortenerPopupTabs.set(tab.id, Date.now());
+        setTimeout(() => { recentShortenerPopupTabs.delete(tab.id); }, 8000);
+    });
+}
+
 if (chrome.tabs?.onRemoved) {
     chrome.tabs.onRemoved.addListener((tabId) => {
         lastDestinationByTab.delete(tabId);
+        visitHistoryByTab.delete(tabId);
+        patientTabs.delete(tabId);
+        lastAdvertisedByTab.delete(tabId);
+        recentShortenerPopupTabs.delete(tabId);
+        persistTabState();
     });
 }
 
 // Streaming platforms with DRM protection
-const STREAMING_DOMAINS = [
+const STREAMING_DOMAINS = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.STREAMING) ? KILLURL_SITES.STREAMING : [
     'netflix.com', 'www.netflix.com',
     'disneyplus.com', 'www.disneyplus.com',
     'hotstar.com', 'www.hotstar.com',
@@ -66,7 +338,8 @@ const STREAMING_DOMAINS = [
 ];
 
 // Known URL shortener domains and their patterns
-const SHORTENER_DOMAINS = [
+// Note: MediaFire, Mega, Google Drive etc. are FINAL DESTINATIONS, NOT shorteners!
+const SHORTENER_DOMAINS = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.SHORTENERS) ? KILLURL_SITES.SHORTENERS : [
     // Popular shorteners
     'bit.ly', 'bitly.com', 'tinyurl.com', 'goo.gl', 't.co',
     'ow.ly', 'is.gd', 'buff.ly', 'adf.ly', 'j.mp',
@@ -103,8 +376,8 @@ const SHORTENER_DOMAINS = [
     'reqlinks.net',
     'krfrn.xyz', 'kfrn.xyz',
     'modishortner.com',
-    // File hosting / download with timers
-    'mediafire.com', 'mega.nz',
+    'vplink.in', 'vplinks.in',
+    // File hosting / download with timers (mediafire and mega REMOVED - they are destinations)
     'uploadhaven.com', 'upload.ee',
     'datanodes.to', 'ddownload.com',
     'usersdrive.com',
@@ -230,8 +503,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return true;
 
         case 'CHECK_SHORTENER':
-            const isShortener = isKnownShortener(message.hostname);
-            sendResponse({ isShortener, domains: SHORTENER_DOMAINS });
+            const hostname = message.hostname ? message.hostname.replace(/^www\./, '').toLowerCase() : '';
+            const isProt = typeof KILLURL_SITES !== 'undefined' ? KILLURL_SITES.isProtected(hostname) : false;
+            const isFin = typeof KILLURL_SITES !== 'undefined' ? KILLURL_SITES.isFinal(hostname) : false;
+            const isShortener = (!isProt && !isFin) ? isKnownShortener(hostname) : false;
+            sendResponse({
+                isShortener,
+                isProtected: isProt,
+                isFinal: isFin,
+                domains: typeof KILLURL_SITES !== 'undefined' ? KILLURL_SITES.SHORTENERS : SHORTENER_DOMAINS
+            });
             return true;
 
         case 'SKIP_COUNTDOWN':
@@ -265,36 +546,262 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             (async () => {
                 const s = await getSettings();
                 if (s.enabled === false) { sendResponse({ success: false, disabled: true }); return; }
-                if (sender.tab) {
+                await restoreTabState();
+                if (sender.tab && message.url) {
+                    const destHost = hostOf(message.url);
+                    const isShortener = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isShortener) ? KILLURL_SITES.isShortener(destHost) : isKnownShortener(destHost);
+                    const isErr = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl) ? KILLURL_SITES.isErrorUrl(message.url) : false;
+
+                    // Intermediate shorteners and error URLs are NEVER valid final destinations!
+                    if (isShortener || isErr) {
+                        console.log('[KillURL:BG] Discarding non-final destination candidate:', message.url);
+                        sendResponse({ success: false });
+                        return;
+                    }
+
+                    const isFinalDest = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isValidFinalDestination) ? KILLURL_SITES.isValidFinalDestination(message.url) : false;
                     chrome.action.setBadgeText({ text: '!', tabId: sender.tab.id });
                     chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId: sender.tab.id });
-                    // Remember it so the NEXT page load on that host is
-                    // recognized as the arrival, not another step to skip.
-                    if (message.url) lastDestinationByTab.set(sender.tab.id, message.url);
+
+                    if (isFinalDest) {
+                        lastDestinationByTab.set(sender.tab.id, message.url);
+                        await persistTabState();
+                        // Auto-redirect only if this is an authentic final destination and autoRedirect is enabled
+                        if (s.autoRedirect || message.autoRedirect) {
+                            console.log('[KillURL] Auto-redirecting tab to authentic final destination:', message.url);
+                            chrome.tabs.update(sender.tab.id, { url: message.url });
+                        }
+                    }
                 }
+                sendResponse({ success: true });
+            })();
+            return true;
+
+        case 'RESOLVE_BYPASS':
+            // Fast remote bypass resolution request from content script or popup
+            (async () => {
+                try {
+                    const dest = await resolveShortenerUrl(message.url);
+                    if (dest && !(typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl && KILLURL_SITES.isErrorUrl(dest))) {
+                        if (sender.tab?.id) {
+                            lastDestinationByTab.set(sender.tab.id, dest);
+                            await persistTabState();
+                        }
+                        sendResponse({ success: true, destination: dest });
+                        return;
+                    }
+                } catch (e) { /* ignore */ }
+                sendResponse({ success: false });
+            })();
+            return true;
+
+        case 'CHAIN_COMPLETED':
+            // Destination reached — clean up tab state and set success badge
+            (async () => {
+                try {
+                    await restoreTabState();
+                    const tabId = sender.tab?.id;
+                    if (tabId != null) {
+                        lastDestinationByTab.delete(tabId);
+                        visitHistoryByTab.delete(tabId);
+                        patientTabs.delete(tabId);
+                        await persistTabState();
+                        try {
+                            await chrome.action.setBadgeText({ text: '✓', tabId });
+                            await chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId });
+                        } catch (err) {}
+                    }
+                } catch (e) { /* ignore */ }
                 sendResponse({ success: true });
             })();
             return true;
 
         case 'CHECK_ARRIVED':
             // "Am I the destination page?" — content script asks on every load.
-            // One-shot: consumed on first match so later visits behave normally.
-            {
+            (async () => {
                 let arrived = false;
                 try {
+                    await restoreTabState();
                     const tabId = sender.tab?.id;
-                    const remembered = (tabId != null) ? lastDestinationByTab.get(tabId) : null;
-                    if (remembered && message.url) {
-                        const destHost = hostOf(remembered);
-                        const hereHost = hostOf(message.url);
-                        if (destHost && hereHost && destHost === hereHost) {
+                    const hereHost = hostOf(message.url);
+
+                    // Error, penalty, or honeypot pages are NEVER an arrival!
+                    if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl && KILLURL_SITES.isErrorUrl(message.url)) {
+                        sendResponse({ arrived: false, isError: true });
+                        return;
+                    }
+
+                    // Known shorteners are NEVER an arrival!
+                    if ((typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isShortener(hereHost)) || isKnownShortener(hereHost)) {
+                        sendResponse({ arrived: false, isShortener: true });
+                        return;
+                    }
+
+                    // 1. Direct check: Is this host in the FINAL list (MediaFire, Mega, Google Drive, etc.)?
+                    if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isFinal(hereHost)) {
+                        // Double check that it's a real file download link and not an error page
+                        if (!KILLURL_SITES.isErrorUrl(message.url)) {
                             arrived = true;
-                            lastDestinationByTab.delete(tabId);
+                            if (tabId != null) {
+                                lastDestinationByTab.delete(tabId);
+                                visitHistoryByTab.delete(tabId);
+                                patientTabs.delete(tabId);
+                                await persistTabState();
+                                try {
+                                    await chrome.action.setBadgeText({ text: '✓', tabId });
+                                    await chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId });
+                                } catch (err) {}
+                            }
+                            sendResponse({ arrived: true, isFinal: true });
+                            return;
+                        }
+                    }
+
+                    // 2. Remembered destination match
+                    const remembered = (tabId != null) ? lastDestinationByTab.get(tabId) : null;
+                    if (remembered && message.url && !KILLURL_SITES.isErrorUrl(remembered)) {
+                        const destHost = hostOf(remembered);
+                        if (destHost && hereHost && !isKnownShortener(hereHost)) {
+                            const isMatch = (destHost === hereHost && pathIsPrefixOf(remembered, message.url)) ||
+                                (typeof KILLURL_SITES !== 'undefined' && (KILLURL_SITES.isFinal(destHost) || KILLURL_SITES.isFinal(hereHost)));
+                            if (isMatch) {
+                                arrived = true;
+                                lastDestinationByTab.delete(tabId);
+                                if (exactUrlMatch(remembered, message.url) || (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isFinal(hereHost))) {
+                                    visitHistoryByTab.delete(tabId);
+                                    patientTabs.delete(tabId);
+                                }
+                                await persistTabState();
+                                if (tabId != null) {
+                                    try {
+                                        await chrome.action.setBadgeText({ text: '✓', tabId });
+                                        await chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId });
+                                    } catch (err) {}
+                                }
+                            }
                         }
                     }
                 } catch (e) { /* ignore */ }
                 sendResponse({ arrived });
+            })();
+            return true;
+
+        case 'CHECK_LOOP':
+            // HOST-SCOPED enforcement, never tab-scoped: the verdict is a
+            // function of the CURRENT page's host only (seed list or learned
+            // list), evaluated fresh on every load. A tab that bounced on one
+            // host no longer forces patient behavior onto every other host in
+            // the same tab — that blanket stickiness was the "protection in
+            // wrong places" bug. Visit history is ALWAYS recorded (patient or
+            // not) so bounces can be learned and arrivals stay detectable.
+            (async () => {
+                let loop = false;
+                let learnedHit = false;
+                let visits = 1;
+                let hostVisits = 1;
+                let required = null;
+                let malleable = false;
+                let strict = false;
+                let bounces = 0;
+                try {
+                    await restoreTabState();
+                    const tabId = sender.tab?.id;
+                    if (tabId != null && message.url) {
+                        const curHost = hostOf(message.url);
+
+                        // 0. Resolve any in-flight malleability probe from the
+                        // previous page in this tab. A FRESH step key means the
+                        // backdated submit advanced the chain (verdict:
+                        // malleable); landing on a seen key means it bounced
+                        // (verdict: strict — deadline floor only from now on).
+                        // Stale probes (>90s, stalled page) resolve to nothing.
+                        try {
+                            const probe = probeByTab.get(tabId);
+                            if (probe && (Date.now() - probe.t) < PROBE_TTL_MS) {
+                                const seenBefore = (() => {
+                                    try {
+                                        const h = visitHistoryByTab.get(tabId) || [];
+                                        return h.some(e => e && e.key === loopKey(message.url));
+                                    } catch (e) { return false; }
+                                })();
+                                if (!seenBefore) {
+                                    await setHostExperiment(probe.host, 'malleable');
+                                    console.log('[KillURL] Probe SUCCEEDED — aged tokens pass on', probe.host);
+                                } else {
+                                    await setHostExperiment(probe.host, 'strict');
+                                    console.log('[KillURL] Probe FAILED (bounced) — strict deadline only on', probe.host);
+                                }
+                            }
+                            probeByTab.delete(tabId);
+                        } catch (e) { /* ignore */ }
+
+                        // 1. Seed hosts / learned hosts: Fast Server-Timer Bypass mode
+                        const learned = await getLearnedPatientHosts();
+                        const entry = learned.find(e => curHost === e.h || curHost.endsWith('.' + e.h));
+                        if (entry) {
+                            loop = true;
+                            learnedHit = true;
+                            required = Math.min((typeof entry.s === 'number' && entry.s > 0) ? entry.s : 3, 4);
+                            malleable = true;
+                            strict = false;
+                            bounces = entry.b || 0;
+                        } else {
+                            malleable = true;
+                        }
+
+                        // 2. Revisit detection (always recorded)
+                        const now = Date.now();
+                        const fresh = (hist) => (hist || []).filter(e => e && (now - e.t) < LOOP_WINDOW_MS).slice(-30);
+                        let hist = fresh(visitHistoryByTab.get(tabId));
+                        const cur = loopKey(message.url);
+                        const prev = hist.filter(e => e.key === cur).length;
+                        visits = prev + 1;
+                        hist.push({ key: cur, t: now });
+                        hist = hist.slice(-30);
+                        visitHistoryByTab.set(tabId, hist);
+                        hostVisits = hist.filter(e => e.key.startsWith(curHost + '/')).length;
+
+                        // 3. Repeat bounce: keep tight 3-4s window, never lock into 25-120s stalls
+                        if (prev >= 1) {
+                            loop = true;
+                            const failedAd = lastAdvertisedByTab.get(tabId);
+                            let guess = (typeof failedAd === 'number' && failedAd > 0) ? Math.min(failedAd, 4) : 3;
+                            lastAdvertisedByTab.delete(tabId);
+                            await learnPatientHost(curHost, guess);
+                            required = guess;
+                            malleable = true;
+                        }
+                        await persistTabState();
+                    }
+                } catch (e) { /* ignore */ }
+                sendResponse({ loop, learned: learnedHit, visits, hostVisits, required, malleable: true, strict: false, bounces });
+            })();
+            return true;
+
+        case 'PROBE_STARTED':
+            // A content script just fired a backdated (aged-token) submit.
+            // Remember it so the NEXT CHECK_LOOP from this tab can score it:
+            // fresh step = aged tokens pass (malleable), revisit = rejected.
+            try {
+                if (sender.tab?.id != null && message.host) {
+                    probeByTab.set(sender.tab.id, { host: String(message.host), t: Date.now() });
+                }
+                sendResponse({ success: true });
+            } catch (e) {
+                try { sendResponse({ success: false }); } catch (err) { /* ignore */ }
             }
+            return true;
+
+        case 'RESET_LEARNED_PATIENT':
+            (async () => {
+                try {
+                    await chrome.storage.local.remove(LEARNED_PATIENT_STORE);
+                    patientTabs.clear();
+                    try { await chrome.storage.session.remove('kuTabState'); } catch (e) { /* ignore */ }
+                    console.log('[KillURL] Learned patient hosts cleared');
+                } catch (e) { /* ignore */ }
+                sendResponse({ success: true });
+            })();
             return true;
 
         case 'PAGE_STATUS':
@@ -309,6 +816,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     return;
                 }
                 if (sender.tab) {
+                    // Remember this step's advertised countdown. When a bounce
+                    // lands next, THIS value is what the FAILED step required —
+                    // the attribution used to learn the host's true wait.
+                    if (typeof message.advertised === 'number' && message.advertised > 0) {
+                        lastAdvertisedByTab.set(sender.tab.id, message.advertised);
+                        persistTabState();
+                    }
                     if (message.detected) {
                         chrome.action.setBadgeText({ text: '⏭', tabId: sender.tab.id });
                         chrome.action.setBadgeBackgroundColor({ color: '#f59e0b', tabId: sender.tab.id });
@@ -575,6 +1089,16 @@ function skipCountdownInjection() {
 
 // Listen for tab updates to auto-detect shortener pages and inject DRM bypass
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+    // Check if a popup tab opened from a shortener navigated to an ad
+    if (changeInfo.url && recentShortenerPopupTabs.has(tabId)) {
+        if (isAdPopupUrl(changeInfo.url)) {
+            console.log('[KillURL:BG] Closed deferred ad popup tab:', tabId, changeInfo.url.slice(0, 80));
+            recentShortenerPopupTabs.delete(tabId);
+            try { chrome.tabs.remove(tabId); } catch (e) { /* ignore */ }
+            return;
+        }
+    }
+
     if (changeInfo.status === 'complete' && tab.url) {
         try {
             const currentSettings = await getSettings();
@@ -589,6 +1113,24 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
             const hostname = url.hostname.replace(/^www\./, '');
 
             if (isKnownShortener(hostname)) {
+                // Background remote bypass resolution in parallel
+                resolveShortenerUrl(tab.url).then(async (dest) => {
+                    if (dest && !(typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl && KILLURL_SITES.isErrorUrl(dest))) {
+                        lastDestinationByTab.set(tabId, dest);
+                        await persistTabState();
+                        try {
+                            await chrome.tabs.sendMessage(tabId, {
+                                type: 'RESOLVER_FOUND_DESTINATION',
+                                url: dest
+                            });
+                        } catch (e) {}
+                        if (currentSettings.autoRedirect || currentSettings.autoSkip) {
+                            console.log('[KillURL] Auto-redirecting via remote bypass resolver:', dest);
+                            chrome.tabs.update(tabId, { url: dest });
+                        }
+                    }
+                }).catch(() => {});
+
                 // Notify the content script that this is a detected shortener
                 try {
                     await chrome.tabs.sendMessage(tabId, {
