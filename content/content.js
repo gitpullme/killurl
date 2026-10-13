@@ -528,6 +528,7 @@
         '#countdown-timer', '.countdown-timer', '#timer-count', '.timer-count',
         '#time-left', '.time-left', '#timeLeft', '.timeLeft',
         '#link1s-time', '#tp-time', '#link1s-wait1', '#tp-wait1',
+        '#ce-time', '#ce-wait1', '.ce-time', '.ce-wait1',
         '[id*="link1s"]', '[id*="tp-"]',
         '[id*="time"]', '[class*="time"]',
         '#step', '.step', '[id*="step"]', '[class*="step-"]',
@@ -4310,13 +4311,51 @@
         console.log('[KillURL] Paced Step Controller initialized on:', window.location.href);
 
         const host = window.location.hostname.replace(/^www\./, '').toLowerCase();
-        const isStep3 = host.includes('bcsakhi') ||
-                        host.includes('educatestudies') ||
-                        !!document.querySelector('a[href*="/educatestudies/learn_more.php"]');
+        const path = window.location.pathname.toLowerCase();
+        const qSearch = search.toLowerCase();
+
+        // 1. Precise Step 2 Detection (Article 2 of 3)
+        // Signals: presence of btn6/btn7/ce-wait1/ce-time, nextbtn(), studyeducates path or host, or query signals
+        const hasStep2Signals = qSearch.includes('educationsuniversities') ||
+                                path.includes('studyeducates') ||
+                                host.includes('studyeducates') ||
+                                !!document.getElementById('btn6') ||
+                                !!document.getElementById('btn7') ||
+                                !!document.getElementById('ce-wait1') ||
+                                !!document.getElementById('ce-time') ||
+                                (document.documentElement && document.documentElement.innerHTML.includes('nextbtn()'));
+
+        // 2. Precise Step 3 Detection (Final Article 3 of 3)
+        // Signals: bcsakhi host, educatestudies without Step 2 elements, or tp-snp2 / cross-snp2
+        const hasStep3Signals = host.includes('bcsakhi') ||
+                                path.includes('bcsakhi') ||
+                                (!hasStep2Signals && (host.includes('educatestudies') || path.includes('educatestudies')));
+
+        let stepNum = 1;
+        let stepLabel = 'STEP 1/3';
+
+        if (hasStep2Signals) {
+            stepNum = 2;
+            stepLabel = 'STEP 2/3';
+        } else if (hasStep3Signals) {
+            stepNum = 3;
+            stepLabel = 'FINAL STEP 3/3';
+        } else {
+            try {
+                const chainInfo = await chrome.runtime.sendMessage({ type: 'GET_CHAIN_ELAPSED' });
+                if (chainInfo && chainInfo.step === 2) {
+                    stepNum = 2;
+                    stepLabel = 'STEP 2/3';
+                } else if (chainInfo && chainInfo.step === 3) {
+                    stepNum = 3;
+                    stepLabel = 'FINAL STEP 3/3';
+                }
+            } catch (e) { /* ignore */ }
+        }
 
         // Pre-seed shortcut cookies without destroying blog session tracking:
         try {
-            if (isStep3) {
+            if (stepNum === 3 || host.includes('bcsakhi') || host.includes('educatestudies')) {
                 if (!document.cookie.includes('adcadg=')) {
                     document.cookie = 'adcadg=insurance,online_colleges,study_abroad,finance,loan; path=/; max-age=3600';
                 }
@@ -4338,39 +4377,41 @@
             if (gcont && gcont.style.position !== 'static') gcont.style.position = 'static';
         } catch (e) { /* ignore */ }
 
-        // Determine step index
-        let stepNum = 1;
-        let stepLabel = 'STEP 1/3';
-        if (isStep3) {
-            stepNum = 3;
-            stepLabel = 'FINAL STEP 3/3';
-        } else {
-            const hasStep2Signals = window.location.search.includes('educationsuniversities') ||
-                                    !!document.getElementById('btn6') ||
-                                    !!document.getElementById('btn7') ||
-                                    !!document.getElementById('ce-wait1') ||
-                                    !!document.getElementById('ce-time') ||
-                                    (document.documentElement && document.documentElement.innerHTML.includes('nextbtn()'));
-            if (hasStep2Signals) {
-                stepNum = 2;
-                stepLabel = 'STEP 2/3';
-            } else {
-                try {
-                    const chainInfo = await chrome.runtime.sendMessage({ type: 'GET_CHAIN_ELAPSED' });
-                    if (chainInfo && chainInfo.step === 2) {
-                        stepNum = 2;
-                        stepLabel = 'STEP 2/3';
+        function triggerPacedInitialAction(sNum) {
+            try {
+                if (sNum === 2) {
+                    const btn6 = document.getElementById('btn6');
+                    if (btn6) {
+                        btn6.style.setProperty('display', 'block', 'important');
+                        btn6.style.setProperty('visibility', 'visible', 'important');
+                        btn6.removeAttribute('disabled');
+                        dispatchFullClickSequence(btn6);
                     }
-                } catch (e) { /* ignore */ }
-            }
+                    if (typeof window.nextbtn === 'function') {
+                        try { window.nextbtn(); } catch (e) {}
+                    }
+                } else {
+                    const initBtn = document.getElementById('tp-snp') ||
+                                    document.getElementById('cross-snp') ||
+                                    document.getElementById('startCountdownBtn') ||
+                                    document.querySelector('button.start-countdown, a.start-countdown');
+                    if (initBtn && isVisible(initBtn)) {
+                        dispatchFullClickSequence(initBtn);
+                    }
+                }
+            } catch (e) { /* ignore */ }
         }
+
+        // Trigger initial step action immediately on page load so native countdown runs naturally from t=0
+        triggerPacedInitialAction(stepNum);
+        setTimeout(() => triggerPacedInitialAction(stepNum), 500);
+        setTimeout(() => triggerPacedInitialAction(stepNum), 1500);
 
         function findPacedAdvanceButton(sNum) {
             if (sNum === 2) {
                 return document.getElementById('btn1') ||
                        document.getElementById('btn7') ||
-                       document.getElementById('btn6') ||
-                       document.querySelector('a[href*="learn_more.php"], button#btn1');
+                       document.querySelector('a[href*="learn_more.php"], button#btn1, button#btn7');
             }
             if (sNum === 3) {
                 return document.getElementById('tp-snp2') ||
@@ -4416,21 +4457,25 @@
                 return;
             }
 
-            // Sync with page timer if higher
-            const pageRem = readCountdownValue();
-            if (pageRem != null && pageRem > 0 && pageRem > totalSec) {
-                totalSec = pageRem;
-            }
-
             const elapsedMs = Date.now() - startTime;
             const elapsedSec = elapsedMs / 1000;
+
+            // Sync with page timer if higher
+            const pageRem = readCountdownValue();
+            if (pageRem != null && pageRem > 0) {
+                const requiredTotal = Math.max(PACED_STEP_FLOOR_SEC, Math.ceil(elapsedSec + pageRem));
+                if (requiredTotal > totalSec) {
+                    totalSec = requiredTotal;
+                }
+            }
+
             const remainingSec = Math.max(0, Math.ceil(totalSec - elapsedSec));
             const progressPct = Math.min(100, Math.max(0, (elapsedSec / totalSec) * 100));
 
             const btnReady = !!findPacedAdvanceButton(stepNum);
 
-            // Complete strictly after the full 15s+ pacing duration has elapsed (never early advance!)
-            if (elapsedSec >= totalSec) {
+            // Complete strictly after the full 15s+ pacing duration has elapsed AND page countdown has reached 0
+            if (elapsedSec >= totalSec && (pageRem == null || pageRem <= 0)) {
                 clearInterval(pacedInterval);
                 const doneMsg = (stepNum === 3)
                     ? 'MediaFire clearance secured! Unlocking destination...'
@@ -4485,27 +4530,46 @@
         }, 100);
     }
 
-    async function executePacedStepAdvance(stepNum) {
-        if (pacedAdvanceExecuted) return;
-        pacedAdvanceExecuted = true;
-        unloading = true;
+    let pacedAdvanceInProgress = false;
+    let recoveryTier = 0;
+    let recoveryTimer = null;
 
-        console.log(`[KillURL] Advancing paced step ${stepNum}...`);
+    async function executePacedStepAdvance(stepNum, isRecovery = false) {
+        if (pacedAdvanceInProgress && !isRecovery) return;
+        pacedAdvanceInProgress = true;
 
         const currentHost = window.location.hostname.replace(/^www\./, '').toLowerCase();
-        renderSmartBar({
-            step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
-            message: (stepNum === 3) ? 'Unlocking destination • Redirecting to MediaFire gateway...' : `Step ${stepNum} complete! Loading next article...`,
-            telemetry: '🚀 Transit Button Clicked • Navigating Forward',
-            remaining: 0,
-            progressPct: 100,
-            icon: '⚡',
-            isReady: true
-        });
+        const navFrom = window.location.href;
 
-        try {
-            await chrome.runtime.sendMessage({ type: 'ADVANCE_CHAIN_STEP' });
-        } catch (e) { /* ignore */ }
+        if (isRecovery) {
+            recoveryTier++;
+            console.log(`[KillURL] Self-Recovery Watchdog Tier ${recoveryTier} executing on step ${stepNum}...`);
+            renderSmartBar({
+                step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
+                message: `Self-Recovery Active (Tier ${recoveryTier}) • Rescuing step ${stepNum} navigation...`,
+                telemetry: `🔄 Autonomous Watchdog • Tier ${recoveryTier} Unblock Sequence Active`,
+                remaining: 0,
+                progressPct: 100,
+                icon: '🔄',
+                isReady: true
+            });
+        } else {
+            recoveryTier = 0;
+            console.log(`[KillURL] Advancing paced step ${stepNum}...`);
+            renderSmartBar({
+                step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
+                message: (stepNum === 3) ? 'Unlocking destination • Redirecting to MediaFire gateway...' : `Step ${stepNum} complete! Loading next article...`,
+                telemetry: '🚀 Transit Button Clicked • Navigating Forward',
+                remaining: 0,
+                progressPct: 100,
+                icon: '⚡',
+                isReady: true
+            });
+
+            try {
+                await chrome.runtime.sendMessage({ type: 'ADVANCE_CHAIN_STEP' });
+            } catch (e) { /* ignore */ }
+        }
 
         // Pre-seed shortcut cookies without destroying blog session tracking:
         try {
@@ -4543,10 +4607,10 @@
 
         // Find primary advance button & anchor
         let btn = (stepNum === 2)
-            ? (document.getElementById('btn1') || document.querySelector('a[href*="/studyeducates/learn_more.php"], button#btn1'))
+            ? (document.getElementById('btn1') || document.getElementById('btn7') || document.querySelector('a[href*="learn_more.php"], button#btn1, button#btn7'))
             : (document.getElementById('tp-snp2') || document.getElementById('cross-snp2') || document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61'));
 
-        let anchor = btn?.tagName === 'A' ? btn : (btn?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"]'));
+        let anchor = btn?.tagName === 'A' ? btn : (btn?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="studyeducates"]'));
 
         if (btn) {
             btn.style.setProperty('display', 'block', 'important');
@@ -4567,19 +4631,67 @@
             if (btn && btn !== anchor) dispatchFullClickSequence(btn);
         } catch (e) { /* ignore */ }
 
-        const navFrom = window.location.href;
-        setTimeout(() => {
+        // Arm Autonomous Self-Recovery Watchdog
+        if (recoveryTimer) clearTimeout(recoveryTimer);
+        recoveryTimer = setTimeout(() => {
             try {
-                if (window.location.href === navFrom) {
-                    const dest = anchor?.getAttribute('href') || (stepNum === 3 ? '/educatestudies/learn_more.php' : '/studyeducates/learn_more.php');
+                if (window.location.href !== navFrom || unloading) return;
+
+                if (recoveryTier === 0) {
+                    // Tier 1: Check form submissions and re-dispatch clicks
+                    console.log('[KillURL] Self-Recovery: Tier 1 - Checking forms and re-dispatching click sequence');
+                    const forms = Array.from(document.querySelectorAll('form'));
+                    const transitForm = forms.find(f => (f.action || '').includes('learn_more') || (f.action || '').includes('educate') || (f.action || '').includes('study'));
+                    if (transitForm) {
+                        try { transitForm.submit(); return; } catch (e) {}
+                    }
+                    executePacedStepAdvance(stepNum, true);
+                } else if (recoveryTier === 1) {
+                    // Tier 2: Deep scan of DOM anchors & direct href resolution
+                    console.log('[KillURL] Self-Recovery: Tier 2 - Deep scanning anchors for valid transit target');
+                    const anyAnchor = document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="studyeducates"]');
+                    const dest = anyAnchor?.getAttribute('href') || anchor?.getAttribute('href');
                     if (dest && !dest.startsWith('#') && !dest.startsWith('javascript:')) {
                         const resolved = new URL(dest, window.location.href).href;
-                        console.log(`[KillURL] Step ${stepNum} fallback navigation to:`, resolved);
+                        console.log('[KillURL] Self-Recovery Tier 2 navigating directly to:', resolved);
                         window.location.href = resolved;
+                        return;
                     }
+                    executePacedStepAdvance(stepNum, true);
+                } else if (recoveryTier === 2) {
+                    // Tier 3: Contextual destination resolution
+                    console.log('[KillURL] Self-Recovery: Tier 3 - Resolving contextual transit URL');
+                    let fallbackPath = (stepNum === 3) ? '/educatestudies/learn_more.php' : '/studyeducates/learn_more.php';
+                    if (window.location.pathname.includes('studyeducates')) {
+                        fallbackPath = '/studyeducates/learn_more.php';
+                    } else if (window.location.pathname.includes('educatestudies')) {
+                        fallbackPath = '/educatestudies/learn_more.php';
+                    }
+                    const resolved = new URL(fallbackPath, window.location.href).href;
+                    console.log('[KillURL] Self-Recovery Tier 3 navigating to:', resolved);
+                    window.location.href = resolved;
+                    executePacedStepAdvance(stepNum, true);
+                } else {
+                    // Tier 4: Session-Preserved Auto-Reload
+                    // Reloading refreshes DOM state and succeeds with 100% authentic MediaFire clearance without user intervention
+                    console.log('[KillURL] Self-Recovery: Tier 4 - Performing session-preserved auto-reload');
+                    renderSmartBar({
+                        step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
+                        message: 'Self-Recovery complete • Auto-refreshing to clear transit lock...',
+                        telemetry: '🔄 Session Preserved • Auto-Reloading Page Safely',
+                        remaining: 0,
+                        progressPct: 100,
+                        icon: '🔄',
+                        isReady: true
+                    });
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 800);
                 }
-            } catch (e) { /* ignore */ }
-        }, 1000);
+            } catch (e) {
+                console.error('[KillURL] Error during self-recovery:', e);
+            }
+        }, 1800);
     }
 
     let vplinkFinalStarted = false;
