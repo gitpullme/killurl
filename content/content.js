@@ -4282,6 +4282,114 @@
         });
     }
 
+    function isCategoryArchivePage() {
+        // If single-article verification / timer element is already in DOM, it is definitely a post, not an archive
+        if (document.getElementById('btn6') ||
+            document.getElementById('btn7') ||
+            document.getElementById('btn1') ||
+            document.getElementById('ce-time') ||
+            document.getElementById('ce-wait1') ||
+            document.getElementById('tp-snp') ||
+            document.getElementById('tp-snp2') ||
+            document.getElementById('cross-snp') ||
+            document.getElementById('cross-snp2') ||
+            document.getElementById('startCountdownBtn') ||
+            document.querySelector('.start-countdown, .button-61, button#btn6, button#btn7, button#btn1')) {
+            return false;
+        }
+
+        // Check WordPress archive body classes
+        const bClass = document.body?.className || '';
+        if (/\b(archive|category|blog|home|search-results)\b/i.test(bClass)) {
+            return true;
+        }
+
+        // Check path: if root, category slug without sub-post slug (e.g. /studyeducates/ or /studyinsurances/)
+        const path = window.location.pathname.toLowerCase().replace(/\/+$/, '');
+        const segments = path.split('/').filter(Boolean);
+        if (segments.length <= 1) {
+            // Check if there are article headings in DOM
+            const headings = document.querySelectorAll('article h2 a, h2.entry-title a, .entry-title a, h2.post-title a, .post-title a');
+            if (headings.length > 0) return true;
+        }
+        if (segments.length > 0 && (segments[0] === 'category' || segments[0] === 'tag' || segments[0] === 'author')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function findArticlePostLink() {
+        const currentHost = window.location.hostname.replace(/^www\./, '').toLowerCase();
+        const currentPath = window.location.pathname.toLowerCase().replace(/\/+$/, '');
+        const segments = currentPath.split('/').filter(Boolean);
+        const catSlug = segments[0] || '';
+
+        const selectors = [
+            'h2.entry-title a',
+            'article h2 a',
+            '.entry-title a',
+            'h2.post-title a',
+            '.post-title a',
+            'main article a[href]',
+            'article a[href]'
+        ];
+
+        // 1. Heading links
+        for (const sel of selectors) {
+            const links = Array.from(document.querySelectorAll(sel));
+            for (const a of links) {
+                const raw = (a.getAttribute('href') || a.href || '').trim();
+                if (!raw || raw.startsWith('#') || raw.startsWith('javascript:')) continue;
+                try {
+                    const u = new URL(raw, window.location.href);
+                    const uHost = u.hostname.replace(/^www\./, '').toLowerCase();
+                    const uPath = u.pathname.toLowerCase().replace(/\/+$/, '');
+                    if (uHost === currentHost && uPath !== currentPath) {
+                        if (!catSlug || uPath.includes(catSlug) || uPath.split('/').filter(Boolean).length >= 2) {
+                            return u.href;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // 2. Category links with slug
+        if (catSlug) {
+            const links = Array.from(document.querySelectorAll(`a[href*="/${catSlug}/"]`));
+            for (const a of links) {
+                const raw = (a.getAttribute('href') || a.href || '').trim();
+                try {
+                    const u = new URL(raw, window.location.href);
+                    const uHost = u.hostname.replace(/^www\./, '').toLowerCase();
+                    const uPath = u.pathname.toLowerCase().replace(/\/+$/, '');
+                    if (uHost === currentHost && uPath !== currentPath && uPath.length > currentPath.length + 3) {
+                        return u.href;
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // 3. Any article link on same host
+        const allLinks = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of allLinks) {
+            const raw = (a.getAttribute('href') || a.href || '').trim();
+            if (!raw || raw.startsWith('#') || raw.startsWith('javascript:')) continue;
+            try {
+                const u = new URL(raw, window.location.href);
+                const uHost = u.hostname.replace(/^www\./, '').toLowerCase();
+                const uPath = u.pathname.toLowerCase().replace(/\/+$/, '');
+                const parts = uPath.split('/').filter(Boolean);
+                if (uHost === currentHost && parts.length >= 1 && uPath !== currentPath) {
+                    if (!['privacy-policy', 'terms', 'contact', 'about', 'disclaimer'].some(x => uPath.includes(x))) {
+                        return u.href;
+                    }
+                }
+            } catch (e) {}
+        }
+        return null;
+    }
+
     let pacedControllerStarted = false;
     let pacedAdvanceExecuted = false;
 
@@ -4290,12 +4398,15 @@
         if (!isPacedDomain()) return;
         if (pacedControllerStarted) return;
 
-        // Skip gateway redirect query pages (they navigate automatically in 0s)
+        const host = window.location.hostname.replace(/^www\./, '').toLowerCase();
+        const path = window.location.pathname.toLowerCase();
         const search = window.location.search || '';
+
+        // 1. Gateway redirect query pages (e.g. ?insurancesstudy=, ?educationsuniversities=)
         if (search.includes('insurancesstudy=') || search.includes('educationsuniversities=') || search.includes('educationstudies=')) {
-            console.log('[KillURL] Gateway redirect page — waiting for automatic article navigation');
+            console.log('[KillURL] Gateway redirect query page detected — monitoring auto-hop');
             renderSmartBar({
-                step: 'GATEWAY TRANSIT',
+                step: `GATEWAY TRANSIT (${host})`,
                 message: 'Routing through secure transit gateway...',
                 telemetry: '⚡ Instant Transit Hop • Auto-Navigating to Article',
                 remaining: 0,
@@ -4304,14 +4415,49 @@
                 icon: '⚡',
                 isReady: true
             });
+            setTimeout(() => {
+                if (window.location.search.includes('insurancesstudy=') || window.location.search.includes('educationsuniversities=') || window.location.search.includes('educationstudies=')) {
+                    const fallbackPost = findArticlePostLink();
+                    if (fallbackPost) {
+                        console.log('[KillURL] Gateway auto-navigating to article post:', fallbackPost);
+                        window.location.href = fallbackPost;
+                    }
+                }
+            }, 350);
             return;
+        }
+
+        // 2. Category Archive / Post Listing Hop
+        if (isCategoryArchivePage()) {
+            const articleLink = findArticlePostLink();
+            if (articleLink) {
+                console.log('[KillURL] Category Archive detected — auto-hopping into post:', articleLink);
+                renderSmartBar({
+                    step: `ROUTING ARTICLE (${host})`,
+                    message: 'Category listing detected • Entering blog post article...',
+                    telemetry: '⚡ Category Archive Detected • Auto-Navigating to Single Post',
+                    remaining: 0,
+                    total: 1,
+                    progressPct: 100,
+                    icon: '⚡',
+                    isReady: true
+                });
+                setTimeout(() => {
+                    window.location.href = articleLink;
+                }, 150);
+                setTimeout(() => {
+                    if (isCategoryArchivePage()) {
+                        console.log('[KillURL] Category hop watchdog navigating to:', articleLink);
+                        window.location.href = articleLink;
+                    }
+                }, 1500);
+                return;
+            }
         }
 
         pacedControllerStarted = true;
         console.log('[KillURL] Paced Step Controller initialized on:', window.location.href);
 
-        const host = window.location.hostname.replace(/^www\./, '').toLowerCase();
-        const path = window.location.pathname.toLowerCase();
         const qSearch = search.toLowerCase();
 
         // 1. Precise Step 2 Detection (Article 2 of 3)
@@ -4407,20 +4553,36 @@
         setTimeout(() => triggerPacedInitialAction(stepNum), 500);
         setTimeout(() => triggerPacedInitialAction(stepNum), 1500);
 
-        function findPacedAdvanceButton(sNum) {
+        function findPacedAdvanceCTA(sNum) {
             if (sNum === 2) {
-                return document.getElementById('btn1') ||
-                       document.getElementById('btn7') ||
-                       document.querySelector('a[href*="learn_more.php"], button#btn1, button#btn7');
+                const s2 = document.getElementById('btn1') ||
+                           document.getElementById('btn7') ||
+                           document.querySelector('button#btn1, button#btn7, a#btn1, a#btn7, .btn1, .btn7, button#nextbtn, a#nextbtn, .nextbtn, a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"]');
+                if (s2) return s2;
+            } else if (sNum === 3) {
+                const s3 = document.getElementById('tp-snp2') ||
+                           document.getElementById('cross-snp2') ||
+                           document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61, a.button-61, a[href*="learn_more.php"], a[href*="vplink"], a[href*="mediafire"]');
+                if (s3) return s3;
             }
-            if (sNum === 3) {
-                return document.getElementById('tp-snp2') ||
-                       document.getElementById('cross-snp2') ||
-                       document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61, a[href*="learn_more.php"]');
+
+            const general = document.getElementById('tp-snp2') ||
+                            document.getElementById('cross-snp2') ||
+                            document.getElementById('btn1') ||
+                            document.getElementById('btn7') ||
+                            document.querySelector('button.button-61, .button-61, a[href*="learn_more.php"]');
+            if (general) return general;
+
+            const cands = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"], div[role="button"]'));
+            for (const el of cands) {
+                if (!isVisible(el)) continue;
+                const txt = (el.textContent || el.value || '').trim().toLowerCase();
+                if (/^(continue|get link|next step|proceed|click here to continue)$/i.test(txt) ||
+                    (txt.length < 35 && /continue|get link|next step/i.test(txt))) {
+                    return el;
+                }
             }
-            return document.getElementById('tp-snp2') ||
-                   document.getElementById('cross-snp2') ||
-                   document.querySelector('button.button-61, button#tp-snp2, .button-61, a[href*="learn_more.php"]');
+            return null;
         }
 
         const cleanHost = host.replace(/^www\./, '');
@@ -4450,9 +4612,9 @@
             isReady: false
         });
 
-        // 100ms high-precision active ticker loop with smooth progress tracking
+        // 100ms high-precision unfreezable ticker loop with smooth progress tracking
         const pacedInterval = setInterval(async () => {
-            if (!isEnabled() || unloading) {
+            if (!isEnabled()) {
                 clearInterval(pacedInterval);
                 return;
             }
@@ -4474,7 +4636,7 @@
             const remainingSec = Math.max(0, Math.ceil(totalSec - elapsedSec));
             const progressPct = Math.min(100, Math.max(0, (elapsedSec / totalSec) * 100));
 
-            const btnReady = !!findPacedAdvanceButton(stepNum);
+            const btnReady = !!findPacedAdvanceCTA(stepNum);
 
             // Complete strictly after the pacing duration has elapsed (never stuck on moving goalpost!)
             if (elapsedSec >= totalSec) {
@@ -4586,11 +4748,30 @@
             }
         } catch (e) { /* ignore */ }
 
+        // Unhide and enable all potential advance candidate elements
+        const ALL_ADVANCE_SELECTORS = [
+            '#btn1', '#btn7', '.btn1', '.btn7', '#tp-snp2', '#cross-snp2',
+            '.button-61', 'button.button-61', 'a.button-61', '#nextbtn', '.nextbtn',
+            'a[href*="learn_more.php"]', 'a[href*="bcsakhi"]', 'a[href*="educatestudies"]', 'a[href*="vplink"]'
+        ];
+        for (const sel of ALL_ADVANCE_SELECTORS) {
+            try {
+                document.querySelectorAll(sel).forEach(el => {
+                    el.style.setProperty('display', 'block', 'important');
+                    el.style.setProperty('visibility', 'visible', 'important');
+                    el.style.setProperty('opacity', '1', 'important');
+                    el.style.setProperty('pointer-events', 'auto', 'important');
+                    el.style.setProperty('z-index', '999999', 'important');
+                    el.removeAttribute('disabled');
+                    el.classList.remove('disabled');
+                    if (el.tagName === 'A') el.target = '_self';
+                });
+            } catch (e) {}
+        }
+
         if (stepNum === 2) {
             const btn6 = document.getElementById('btn6');
             if (btn6) {
-                btn6.style.setProperty('display', 'block', 'important');
-                btn6.style.setProperty('visibility', 'visible', 'important');
                 btn6.removeAttribute('disabled');
                 try { dispatchFullClickSequence(btn6); } catch (e) {}
             }
@@ -4599,87 +4780,104 @@
             }
             const btn7 = document.getElementById('btn7');
             if (btn7) {
-                btn7.style.setProperty('display', 'block', 'important');
-                btn7.style.setProperty('visibility', 'visible', 'important');
-                btn7.style.setProperty('opacity', '1', 'important');
                 btn7.removeAttribute('disabled');
                 try { dispatchFullClickSequence(btn7); } catch (e) {}
             }
         }
 
-        // Find primary advance button & anchor
-        let btn = (stepNum === 2)
-            ? (document.getElementById('btn1') || document.getElementById('btn7') || document.querySelector('a[href*="learn_more.php"], button#btn1, button#btn7'))
-            : (document.getElementById('tp-snp2') || document.getElementById('cross-snp2') || document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61'));
+        // Find primary advance CTA
+        const advanceCTA = findPacedAdvanceCTA(stepNum);
+        let anchor = advanceCTA?.tagName === 'A' ? advanceCTA : (advanceCTA?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"]'));
 
-        let anchor = btn?.tagName === 'A' ? btn : (btn?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="studyeducates"]'));
-
-        if (btn) {
-            btn.style.setProperty('display', 'block', 'important');
-            btn.style.setProperty('visibility', 'visible', 'important');
-            btn.style.setProperty('opacity', '1', 'important');
-            btn.style.setProperty('pointer-events', 'auto', 'important');
-            btn.style.setProperty('z-index', '999999', 'important');
-            btn.removeAttribute('disabled');
+        if (advanceCTA) {
+            try { dispatchFullClickSequence(advanceCTA); } catch (e) {}
+            try { advanceCTA.click(); } catch (e) {}
         }
-        if (anchor) {
-            anchor.style.setProperty('display', 'block', 'important');
-            anchor.style.setProperty('visibility', 'visible', 'important');
-            anchor.target = '_self';
+        if (anchor && anchor !== advanceCTA) {
+            try { dispatchFullClickSequence(anchor); } catch (e) {}
+            try { anchor.click(); } catch (e) {}
         }
 
-        try {
-            if (anchor) dispatchFullClickSequence(anchor);
-            if (btn && btn !== anchor) dispatchFullClickSequence(btn);
-        } catch (e) { /* ignore */ }
+        // If anchor has a cross-domain forward target href, provide a 400ms direct-navigation fallback
+        const anchorHref = anchor?.getAttribute('href') || advanceCTA?.getAttribute('href');
+        if (anchorHref && !anchorHref.startsWith('#') && !anchorHref.startsWith('javascript:')) {
+            try {
+                const u = new URL(anchorHref, window.location.href);
+                const uHost = u.hostname.replace(/^www\./, '').toLowerCase();
+                if (uHost !== currentHost || (u.pathname && u.pathname !== window.location.pathname)) {
+                    setTimeout(() => {
+                        if (window.location.href === navFrom) {
+                            console.log('[KillURL] Fallback direct navigation to CTA target:', u.href);
+                            window.location.href = u.href;
+                        }
+                    }, 400);
+                }
+            } catch (e) {}
+        }
 
         // Arm Autonomous Self-Recovery Watchdog
         if (recoveryTimer) clearTimeout(recoveryTimer);
         recoveryTimer = setTimeout(() => {
             try {
-                if (window.location.href !== navFrom || unloading) return;
+                // If page already navigated, recovery succeeded!
+                if (window.location.href !== navFrom) return;
+
+                // Reset any premature unloading flag so recovery actions can proceed
+                unloading = false;
 
                 if (recoveryTier === 0) {
-                    // Tier 1: Check form submissions and re-dispatch clicks
-                    console.log('[KillURL] Self-Recovery: Tier 1 - Checking forms and re-dispatching click sequence');
+                    // Tier 1: Check form submissions, onclick handlers, and re-dispatch clicks
+                    console.log('[KillURL] Self-Recovery: Tier 1 - Submitting forms and re-triggering CTAs');
                     const forms = Array.from(document.querySelectorAll('form'));
-                    const transitForm = forms.find(f => (f.action || '').includes('learn_more') || (f.action || '').includes('educate') || (f.action || '').includes('study'));
+                    const transitForm = forms.find(f => (f.action || '').includes('learn_more') || (f.action || '').includes('educate') || (f.action || '').includes('bcsakhi') || (f.action || '').includes('study'));
                     if (transitForm) {
                         try { transitForm.submit(); return; } catch (e) {}
                     }
+                    // Check button data-href / onclick
+                    const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                    for (const b of buttons) {
+                        const dHref = b.getAttribute('data-href') || b.getAttribute('data-url') || b.getAttribute('data-link');
+                        if (dHref && !dHref.startsWith('#') && !dHref.startsWith('javascript:')) {
+                            const res = new URL(dHref, window.location.href).href;
+                            console.log('[KillURL] Self-Recovery Tier 1 found data-href:', res);
+                            window.location.href = res;
+                            return;
+                        }
+                    }
                     executePacedStepAdvance(stepNum, true);
                 } else if (recoveryTier === 1) {
-                    // Tier 2: Deep scan of DOM anchors & direct href resolution
-                    console.log('[KillURL] Self-Recovery: Tier 2 - Deep scanning anchors for valid transit target');
-                    const anyAnchor = document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="studyeducates"]');
-                    const dest = anyAnchor?.getAttribute('href') || anchor?.getAttribute('href');
-                    if (dest && !dest.startsWith('#') && !dest.startsWith('javascript:')) {
-                        const resolved = new URL(dest, window.location.href).href;
-                        console.log('[KillURL] Self-Recovery Tier 2 navigating directly to:', resolved);
-                        window.location.href = resolved;
-                        return;
+                    // Tier 2: Deep scan of DOM anchors for valid forward transit target
+                    console.log('[KillURL] Self-Recovery: Tier 2 - Deep scanning anchors for transit destination');
+                    const targetPatterns = (stepNum === 2)
+                        ? ['bcsakhi', 'educatestudies', 'learn_more.php']
+                        : (stepNum === 3 ? ['vplink', 'mediafire', 'learn_more.php'] : ['studyeducates', 'educatestudies', 'bcsakhi']);
+
+                    const allA = Array.from(document.querySelectorAll('a[href]'));
+                    for (const a of allA) {
+                        const h = (a.getAttribute('href') || '').trim();
+                        if (!h || h.startsWith('#') || h.startsWith('javascript:')) continue;
+                        try {
+                            const u = new URL(h, window.location.href);
+                            const uHost = u.hostname.replace(/^www\./, '').toLowerCase();
+                            const uPath = u.pathname.toLowerCase();
+                            // Must match forward target and NOT be self/same category
+                            if (targetPatterns.some(p => uHost.includes(p) || uPath.includes(p))) {
+                                if (u.href !== window.location.href && uPath !== window.location.pathname) {
+                                    console.log('[KillURL] Self-Recovery Tier 2 navigating directly to forward target:', u.href);
+                                    window.location.href = u.href;
+                                    return;
+                                }
+                            }
+                        } catch (e) {}
                     }
-                    executePacedStepAdvance(stepNum, true);
-                } else if (recoveryTier === 2) {
-                    // Tier 3: Contextual destination resolution
-                    console.log('[KillURL] Self-Recovery: Tier 3 - Resolving contextual transit URL');
-                    let fallbackPath = (stepNum === 3) ? '/educatestudies/learn_more.php' : '/studyeducates/learn_more.php';
-                    if (window.location.pathname.includes('studyeducates')) {
-                        fallbackPath = '/studyeducates/learn_more.php';
-                    } else if (window.location.pathname.includes('educatestudies')) {
-                        fallbackPath = '/educatestudies/learn_more.php';
-                    }
-                    const resolved = new URL(fallbackPath, window.location.href).href;
-                    console.log('[KillURL] Self-Recovery Tier 3 navigating to:', resolved);
-                    window.location.href = resolved;
                     executePacedStepAdvance(stepNum, true);
                 } else {
-                    // Tier 4: Session-Preserved Auto-Reload
-                    // Reloading refreshes DOM state and succeeds with 100% authentic MediaFire clearance without user intervention
-                    console.log('[KillURL] Self-Recovery: Tier 4 - Performing session-preserved auto-reload');
+                    // Tier 3: Session-Preserved Autonomous Auto-Reload
+                    // Preserves cookies and clears frozen JavaScript DOM locks cleanly without user intervention!
+                    console.log('[KillURL] Self-Recovery: Tier 3 - Performing session-preserved autonomous auto-reload');
                     renderSmartBar({
                         step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
-                        message: 'Self-Recovery complete • Auto-refreshing to clear transit lock...',
+                        message: 'Self-Recovery active • Auto-refreshing to clear transit lock...',
                         telemetry: '🔄 Session Preserved • Auto-Reloading Page Safely',
                         remaining: 0,
                         progressPct: 100,
@@ -4688,12 +4886,12 @@
                     });
                     setTimeout(() => {
                         window.location.reload();
-                    }, 800);
+                    }, 500);
                 }
             } catch (e) {
                 console.error('[KillURL] Error during self-recovery:', e);
             }
-        }, 1800);
+        }, 1500);
     }
 
     let vplinkFinalStarted = false;
@@ -4769,7 +4967,7 @@
         } catch (e) { /* ignore */ }
 
         const vplinkPoll = setInterval(() => {
-            if (!isEnabled() || unloading) {
+            if (!isEnabled()) {
                 clearInterval(vplinkPoll);
                 return;
             }
