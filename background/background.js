@@ -88,19 +88,18 @@ function isCaptchaShortenerHost(h) {
     return host === 'vplink.in' || host.endsWith('.vplink.in') || host === 'vplinks.in' || host.endsWith('.vplinks.in');
 }
 
-// Clean up any mistakenly learned captcha shortener domains from persistent storage on startup
+function isShortenerHost(h) {
+    if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES && typeof KILLURL_SITES.isShortener === 'function') {
+        return KILLURL_SITES.isShortener(h);
+    }
+    return false;
+}
+
+// Clean up any legacy learned slow-down records on startup so no site stays trapped in 25-120s waits
 (async () => {
     try {
-        const o = await chrome.storage.local.get(LEARNED_PATIENT_STORE);
-        const list = o?.[LEARNED_PATIENT_STORE] || [];
-        const filtered = list.filter(e => {
-            const h = e?.h || '';
-            return !isCaptchaShortenerHost(h);
-        });
-        if (filtered.length !== list.length) {
-            await chrome.storage.local.set({ [LEARNED_PATIENT_STORE]: filtered });
-            console.log('[KillURL] Purged captcha shortener domains from learned patient store');
-        }
+        await chrome.storage.local.remove(LEARNED_PATIENT_STORE);
+        console.log('[KillURL] Cleared persistent learned patient store on boot');
     } catch (e) { /* ignore */ }
 })();
 
@@ -109,12 +108,12 @@ async function getLearnedPatientHosts() {
         const o = await chrome.storage.local.get(LEARNED_PATIENT_STORE);
         const now = Date.now();
         return ((o && o[LEARNED_PATIENT_STORE]) || [])
-            .filter(e => e && typeof e.h === 'string' && !isCaptchaShortenerHost(e.h) && (now - (e.t || 0)) < LEARNED_PATIENT_TTL_MS);
+            .filter(e => e && typeof e.h === 'string' && !isCaptchaShortenerHost(e.h) && !isShortenerHost(e.h) && (now - (e.t || 0)) < LEARNED_PATIENT_TTL_MS);
     } catch (e) { return []; }
 }
 
 async function learnPatientHost(host, requiredSeconds) {
-    if (!host || isCaptchaShortenerHost(host)) return;
+    if (!host || isCaptchaShortenerHost(host) || isShortenerHost(host)) return;
     try {
         const list = await getLearnedPatientHosts();
         // Cap required wait to 3-4s max - never lock into 25-120s stalls
@@ -176,6 +175,8 @@ const PROBE_TTL_MS = 90000;
 // is the value of the step that FAILED — the perfect attribution for
 // learning that host's true wait requirement.
 const lastAdvertisedByTab = new Map(); // tabId -> seconds
+const chainStartByTab = new Map(); // tabId -> timestamp (ms) of multi-step chain start
+const chainStepByTab = new Map(); // tabId -> current step number (1, 2, 3...)
 
 // Tab state ALSO lives in chrome.storage.session: the service worker sleeps
 // during long countdown waits and wakes up amnesiac — arrival memory and loop
@@ -185,13 +186,15 @@ async function persistTabState() {
     if (!hasSessionStorage) return;
     try {
         const kuTabState = {};
-        const tabIds = new Set([...lastDestinationByTab.keys(), ...visitHistoryByTab.keys(), ...patientTabs, ...lastAdvertisedByTab.keys()]);
+        const tabIds = new Set([...lastDestinationByTab.keys(), ...visitHistoryByTab.keys(), ...patientTabs, ...lastAdvertisedByTab.keys(), ...chainStartByTab.keys(), ...chainStepByTab.keys()]);
         for (const id of tabIds) {
             kuTabState[id] = {
                 dest: lastDestinationByTab.get(id) || null,
                 hist: visitHistoryByTab.get(id) || [],
                 patient: patientTabs.has(id),
-                ad: (typeof lastAdvertisedByTab.get(id) === 'number') ? lastAdvertisedByTab.get(id) : null
+                ad: (typeof lastAdvertisedByTab.get(id) === 'number') ? lastAdvertisedByTab.get(id) : null,
+                chain: (typeof chainStartByTab.get(id) === 'number') ? chainStartByTab.get(id) : null,
+                step: (typeof chainStepByTab.get(id) === 'number') ? chainStepByTab.get(id) : 1
             };
         }
         await chrome.storage.session.set({ kuTabState });
@@ -213,6 +216,8 @@ async function restoreTabState() {
             }
             if (st.patient) patientTabs.add(Number(id));
             if (typeof st.ad === 'number' && st.ad > 0) lastAdvertisedByTab.set(Number(id), st.ad);
+            if (typeof st.chain === 'number' && st.chain > 0) chainStartByTab.set(Number(id), st.chain);
+            if (typeof st.step === 'number' && st.step > 0) chainStepByTab.set(Number(id), st.step);
         }
     } catch (e) { /* ignore */ }
 }
@@ -324,6 +329,8 @@ if (chrome.tabs?.onRemoved) {
         patientTabs.delete(tabId);
         lastAdvertisedByTab.delete(tabId);
         recentShortenerPopupTabs.delete(tabId);
+        chainStartByTab.delete(tabId);
+        chainStepByTab.delete(tabId);
         persistTabState();
     });
 }
@@ -407,6 +414,9 @@ const SHORTENER_DOMAINS = (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES
     'mcaf.ee', 'soo.gd', 'clck.ru',
     's.id', 'rotf.lol', 'shorturl.asia',
     // Indian URL shorteners / earn-to-click
+    'rupeeriser.in', 'bcsakhi.in', 'techmint.in',
+    'educatestudies.com', 'studyinsurances.com',
+    'studyeducates.com', 'studyeducations.com', 'insurancesstudy.com',
     'just2earn.com',
     'earnbox.in',
     'whatsagrouplink.online',
@@ -518,6 +528,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             })();
             return true;
 
+        case 'CHECK_URL_HEALTH':
+            (async () => {
+                try {
+                    const targetUrl = message.url;
+                    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+                        sendResponse({ valid: false, reason: 'invalid_format' });
+                        return;
+                    }
+                    if (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl(targetUrl)) {
+                        sendResponse({ valid: false, reason: 'error_pattern', finalUrl: targetUrl });
+                        return;
+                    }
+                    const resp = await fetch(targetUrl, {
+                        method: 'GET',
+                        redirect: 'follow',
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+                        }
+                    });
+                    const finalUrl = resp.url || targetUrl;
+                    const is404 = resp.status === 404 || resp.status === 410 || resp.status === 403;
+                    const isError = is404 ||
+                        finalUrl.includes('error.php') ||
+                        finalUrl.includes('errno=') ||
+                        finalUrl.includes('origin=download') ||
+                        (typeof KILLURL_SITES !== 'undefined' && KILLURL_SITES.isErrorUrl(finalUrl));
+
+                    console.log(`[KillURL:BG] Health check for ${targetUrl}: status=${resp.status}, final=${finalUrl}, isError=${isError}`);
+                    sendResponse({
+                        valid: !isError,
+                        status: resp.status,
+                        finalUrl: finalUrl,
+                        reason: isError ? (finalUrl.includes('320') ? 'file_deleted_320' : 'file_error') : null
+                    });
+                } catch (err) {
+                    console.log('[KillURL:BG] Health check network error (allowing):', err.message);
+                    sendResponse({ valid: true, error: err.message });
+                }
+            })();
+            return true;
+
         case 'CHECK_SHORTENER':
             const hostname = message.hostname ? message.hostname.replace(/^www\./, '').toLowerCase() : '';
             const isProt = typeof KILLURL_SITES !== 'undefined' ? KILLURL_SITES.isProtected(hostname) : false;
@@ -529,6 +580,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 isFinal: isFin,
                 domains: typeof KILLURL_SITES !== 'undefined' ? KILLURL_SITES.SHORTENERS : SHORTENER_DOMAINS
             });
+            return true;
+
+        case 'REGISTER_CHAIN_START':
+            (async () => {
+                await restoreTabState();
+                const tabId = sender.tab?.id;
+                if (tabId != null) {
+                    const existing = chainStartByTab.get(tabId);
+                    if (!existing || (Date.now() - existing) > 300000) {
+                        chainStartByTab.set(tabId, Date.now());
+                        chainStepByTab.set(tabId, 1);
+                        await persistTabState();
+                    }
+                    sendResponse({
+                        success: true,
+                        start: chainStartByTab.get(tabId),
+                        step: chainStepByTab.get(tabId) || 1
+                    });
+                } else {
+                    sendResponse({ success: false });
+                }
+            })();
+            return true;
+
+        case 'ADVANCE_CHAIN_STEP':
+            (async () => {
+                await restoreTabState();
+                const tabId = sender.tab?.id;
+                if (tabId != null) {
+                    const cur = chainStepByTab.get(tabId) || 1;
+                    const next = cur + 1;
+                    chainStepByTab.set(tabId, next);
+                    await persistTabState();
+                    console.log(`[KillURL] Advanced chain step for tab ${tabId}: ${cur} -> ${next}`);
+                    sendResponse({ success: true, step: next });
+                } else {
+                    sendResponse({ success: false });
+                }
+            })();
+            return true;
+
+        case 'GET_CHAIN_ELAPSED':
+            (async () => {
+                await restoreTabState();
+                const tabId = sender.tab?.id;
+                if (tabId != null) {
+                    const start = chainStartByTab.get(tabId);
+                    const elapsed = start ? (Date.now() - start) / 1000 : 0;
+                    const step = chainStepByTab.get(tabId) || 1;
+                    sendResponse({ elapsed, start: start || null, step });
+                } else {
+                    sendResponse({ elapsed: 0, start: null, step: 1 });
+                }
+            })();
             return true;
 
         case 'SKIP_COUNTDOWN':
@@ -621,12 +726,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         lastDestinationByTab.delete(tabId);
                         visitHistoryByTab.delete(tabId);
                         patientTabs.delete(tabId);
+                        chainStartByTab.delete(tabId);
+                        chainStepByTab.delete(tabId);
                         await persistTabState();
                         try {
                             await chrome.action.setBadgeText({ text: '✓', tabId });
                             await chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId });
                         } catch (err) {}
                     }
+                    try { await chrome.storage.local.remove(LEARNED_PATIENT_STORE); } catch (e) {}
                 } catch (e) { /* ignore */ }
                 sendResponse({ success: true });
             })();
@@ -674,6 +782,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                                     await chrome.action.setBadgeBackgroundColor({ color: '#10b981', tabId });
                                 } catch (err) {}
                             }
+                            try { await chrome.storage.local.remove(LEARNED_PATIENT_STORE); } catch (e) {}
                             sendResponse({ arrived: true, isFinal: true });
                             return;
                         }
@@ -791,7 +900,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                         hostVisits = hist.filter(e => e.key.startsWith(curHost + '/')).length;
 
                         // 3. Repeat bounce: keep tight 3-4s window, never lock into 25-120s stalls
-                        if (prev >= 1) {
+                        // Known shorteners and captcha shorteners naturally advance through multiple steps on the same path/host;
+                        // they must never be treated as stuck loops or written to learned patient storage.
+                        if (prev >= 2 && !isShortenerHost(curHost) && !isCaptchaShortenerHost(curHost)) {
                             loop = true;
                             const failedAd = lastAdvertisedByTab.get(tabId);
                             let guess = (typeof failedAd === 'number' && failedAd > 0) ? Math.min(failedAd, 4) : 3;

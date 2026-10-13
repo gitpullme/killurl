@@ -23,6 +23,20 @@
         return;
     }
 
+    // Synchronously pre-seed shortcut cookies without destroying blog session tracking:
+    try {
+        if (frameHost.includes('bcsakhi') || frameHost.includes('educatestudies')) {
+            if (!document.cookie.includes('adcadg=')) {
+                document.cookie = 'adcadg=insurance,online_colleges,study_abroad,finance,loan; path=/; max-age=3600';
+            }
+        }
+        if (frameHost.includes('rupeeriser') || frameHost.includes('studyeducates')) {
+            if (!document.cookie.includes('_uocat=')) {
+                document.cookie = '_uocat=value; path=/; max-age=86400';
+            }
+        }
+    } catch (e) { /* ignore */ }
+
     // ===== STATE =====
     let isShortenerPage = false;
     let isKnownShortener = false; // Confirmed via background domain list
@@ -73,26 +87,16 @@
     // DEADLINE GATE: in server-timer bypass mode, client timers fast-forward and
     // form/net tokens are backdated, so the gate opens within at most ~2s (for initial DOM init).
     function gateReady() {
-        if (!patientMode) {
-            // Even when not in patient mode, do not declare ready if countdown is actively ticking
-            if (countdownIsLive()) return false;
-            return true;
-        }
-        if (hostMalleable && pageTokens && pageTokens.malleableCount > 0 && !countdownIsLive()) return true;
-        const elapsedMs = Date.now() - stepT0;
-        if (elapsedMs >= 2000 && !countdownIsLive()) return true;
-        const observedEnd = sawCountdownMove && !countdownIsLive();
-        if (observedEnd || !countdownIsLive()) return true;
-        return false;
+        const rem = readCountdownValue();
+        if ((rem != null && rem > 0) || countdownIsLive()) return false;
+        return true;
     }
 
     function gateRemainingMs() {
         try {
-            if (!patientMode) return 0;
-            if (hostMalleable && pageTokens && pageTokens.malleableCount > 0 && !countdownIsLive()) return 0;
-            const elapsedMs = Date.now() - stepT0;
-            if ((elapsedMs >= 2000 || (sawCountdownMove && !countdownIsLive())) && !countdownIsLive()) return 0;
-            return Math.max(0, 2000 - elapsedMs);
+            const rem = readCountdownValue();
+            if (rem != null && rem > 0) return rem * 1000;
+            return 0;
         } catch (e) { return 0; }
     }
     // Smoking gun: PROOF of a real countdown (explicit wait-timer text, a digit
@@ -212,14 +216,25 @@
         return CAPTCHA_SHORTENER_DOMAINS.some(d => h === d || h.endsWith('.' + d));
     }
 
+    const PACED_DOMAINS = [
+        'rupeeriser.in', 'bcsakhi.in', 'techmint.in',
+        'educatestudies.com', 'studyinsurances.com',
+        'studyeducations.com', 'insurancesstudy.com',
+        'studyeducates.com'
+    ];
+
+    function isPacedDomain(h) {
+        h = (h || window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+        return PACED_DOMAINS.some(d => h === d || h.endsWith('.' + d));
+    }
+
     function isInterstitialSecurityPage() {
         try {
             const url = (window.location.href || '').toLowerCase();
             const hostname = (window.location.hostname || '').toLowerCase();
 
             // Cloudflare challenge domain / platform URLs
-            if (hostname === 'challenges.cloudflare.com') return true;
-            if (url.includes('/cdn-cgi/challenge-platform/')) return true;
+            if (hostname === 'challenges.cloudflare.com' || hostname.endsWith('.challenges.cloudflare.com')) return true;
             if (url.includes('cf_chl_') || url.includes('__cf_chl_')) return true;
 
             // Full-page blocking challenge elements
@@ -230,16 +245,22 @@
             const html = document.documentElement?.innerHTML || '';
             if (html.includes('id="cf-challenge-running"') ||
                 html.includes('id="challenge-running"') ||
-                html.includes('id="challenge-stage"') ||
-                html.includes('/cdn-cgi/challenge-platform/')) {
+                html.includes('id="challenge-stage"')) {
                 return true;
             }
 
+            const title = (document.title || '').trim();
             const bodyText = document.body?.textContent || '';
+            if (title === 'Just a moment...' || title.includes('Just a moment...')) {
+                if (bodyText.includes('Checking if the site connection is secure') ||
+                    bodyText.includes('Performing security verification') ||
+                    bodyText.includes('Cloudflare')) {
+                    return true;
+                }
+            }
             if (bodyText.includes('Performing security verification') && html.includes('cf-')) return true;
             if (bodyText.includes('Checking if the site connection is secure') && html.includes('cf-')) return true;
             if (bodyText.includes('DDoS protection by') && bodyText.includes('Cloudflare')) return true;
-            if (bodyText.includes('Just a moment...') && (html.includes('cf-challenge') || html.includes('cloudflare'))) return true;
         } catch (e) { /* ignore */ }
         return false;
     }
@@ -249,8 +270,8 @@
             if (isCaptchaShortenerDomain()) return true;
             if (document.querySelector(
                 '.cf-turnstile, [name="cf-turnstile-response"], [data-sitekey], ' +
-                'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"], iframe[src*="turnstile"], ' +
-                'script[src*="challenges.cloudflare.com"], script[src*="turnstile"], script[src*="challenge-platform"], ' +
+                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], ' +
+                'script[src*="challenges.cloudflare.com"], script[src*="turnstile/v0/api.js"], ' +
                 '.g-recaptcha, [name="g-recaptcha-response"], iframe[src*="recaptcha"], script[src*="recaptcha"], ' +
                 '.h-captcha, [name="h-captcha-response"], iframe[src*="hcaptcha"], script[src*="hcaptcha"], ' +
                 '.cf-turnstile-wrapper, .cf-chl-widget'
@@ -258,7 +279,7 @@
                 return true;
             }
             const html = document.documentElement?.innerHTML || '';
-            if (html.includes('challenges.cloudflare.com') || html.includes('turnstile/v0/api.js') || html.includes('cf-turnstile')) {
+            if (html.includes('challenges.cloudflare.com/turnstile') || html.includes('turnstile/v0/api.js') || html.includes('cf-turnstile')) {
                 return true;
             }
         } catch (e) { /* ignore */ }
@@ -330,6 +351,23 @@
     let lastCaptchaPending = false;
     let captchaGateOpened = false;
     function checkCaptchaResolution() {
+        // If on captcha shortener and a valid destination is candidate, process it!
+        if (isCaptchaShortenerDomain()) {
+            findDestinationUrl();
+            if (destinationUrl && !isErrorDestination(destinationUrl)) {
+                processCandidateDestination(destinationUrl);
+                return;
+            }
+            const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #get-link, .get-link, a#get-link, a.get-link, #btn-main, a.btn-main');
+            if (btn) {
+                const href = (btn.getAttribute('href') || btn.href || '').trim();
+                if (href && isValidDestination(href) && !isErrorDestination(href)) {
+                    processCandidateDestination(href);
+                    return;
+                }
+            }
+        }
+
         const pending = isCaptchaPending();
         const hasToken = hasSolvedCaptchaToken();
         if ((lastCaptchaPending && !pending) || (hasToken && !captchaGateOpened)) {
@@ -348,21 +386,22 @@
                     findDestinationUrl();
                     if (destinationUrl && !isErrorDestination(destinationUrl)) {
                         clearInterval(pollInterval);
+                        console.log('[KillURL] Captcha shortener destination found:', destinationUrl);
+                        processCandidateDestination(destinationUrl);
                         return;
                     }
-                    const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #btn-main, a.btn-main');
+                    const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #get-link, .get-link, a#get-link, a.get-link, #btn-main, a.btn-main');
                     if (btn) {
                         const href = (btn.getAttribute('href') || btn.href || '').trim();
                         if (href && isValidDestination(href) && !isErrorDestination(href)) {
                             clearInterval(pollInterval);
                             console.log('[KillURL] Captcha shortener destination ready on CTA:', href);
-                            navigateOrClick(btn);
+                            processCandidateDestination(href);
                             return;
                         }
                     }
-                    if (pollAttempts >= 40) {
+                    if (pollAttempts >= 60) {
                         clearInterval(pollInterval);
-                        clickContinueButton();
                     }
                 }, 500);
                 return;
@@ -532,6 +571,9 @@
         '[id*="getlink"]', '[class*="getlink"]',
         '#countdown-timer', '.countdown-timer', '#timer-count', '.timer-count',
         '#time-left', '.time-left', '#timeLeft', '.timeLeft',
+        '#link1s-time', '#tp-time', '#link1s-wait1', '#tp-wait1',
+        '[id*="link1s"]', '[id*="tp-"]',
+        '[id*="time"]', '[class*="time"]',
         '#step', '.step', '[id*="step"]', '[class*="step-"]',
         '.link-step', '#link-step', '.short-link-step',
     ];
@@ -639,6 +681,25 @@
         if (typeof settings.enabled === 'undefined') settings.enabled = true;
         settingsLoaded = true;
 
+        // If this is a captcha shortener domain (e.g. vplink.in) or multi-step blog, register multi-step chain start
+        if (isCaptchaShortenerDomain() || hostname.includes('rupeeriser')) {
+            try { chrome.runtime.sendMessage({ type: 'REGISTER_CHAIN_START' }); } catch (e) { /* ignore */ }
+        }
+
+        // Pre-seed shortcut cookies for multi-step blog chains
+        try {
+            if (hostname.includes('bcsakhi') || hostname.includes('educatestudies')) {
+                if (!document.cookie.includes('adcadg=')) {
+                    document.cookie = 'adcadg=insurance,online_colleges,study_abroad,finance,loan; path=/; max-age=3600';
+                }
+            }
+            if (hostname.includes('rupeeriser') || hostname.includes('studyeducates')) {
+                if (!document.cookie.includes('_uocat=')) {
+                    document.cookie = '_uocat=value; path=/; max-age=86400';
+                }
+            }
+        } catch (e) { /* ignore */ }
+
         // Effective-state heartbeat: the two most common "nothing happens"
         // causes are a master switch left OFF and autoSkip left OFF — both
         // are answered by this single line, no guessing needed.
@@ -656,6 +717,47 @@
             return;
         }
 
+        // Direct MediaFire error page detector (e.g. errno=320)
+        if (hostname.includes('mediafire.com') && (window.location.href.includes('error.php') || window.location.href.includes('errno='))) {
+            renderSmartBar({
+                step: 'FILE DELETED',
+                message: '❌ MediaFire Error 320: File was deleted from MediaFire by its uploader. (Not a KillURL bypass error).',
+                icon: '⚠️',
+                isReady: false
+            });
+            return;
+        }
+
+        // Auto-recovery for raw JSON /links/go screen
+        const currentPath = (window.location.pathname || '').toLowerCase();
+        if (currentPath.endsWith('/links/go') || currentPath.includes('/links/go')) {
+            let rawJsonHandled = false;
+            function checkRawJsonRecovery() {
+                if (rawJsonHandled) return false;
+                try {
+                    const raw = document.body ? (document.body.innerText || document.body.textContent || '') : '';
+                    const trimmed = raw.trim();
+                    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                        const data = JSON.parse(trimmed);
+                        if (data && data.url) {
+                            rawJsonHandled = true;
+                            console.log('[KillURL] /links/go raw JSON recovery processing destination:', data.url);
+                            processCandidateDestination(data.url);
+                            return true;
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+                return false;
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', checkRawJsonRecovery);
+            } else {
+                checkRawJsonRecovery();
+            }
+            setInterval(checkRawJsonRecovery, 500);
+        }
+
         // Iframe context (ad frames etc.): dormant except the ritual-X
         // watcher. Nothing inside a frame is ever auto-clicked, submitted,
         // revealed or navigated — but a click-ads modal rendered in a frame
@@ -663,6 +765,16 @@
         let inIframe = false;
         try { inIframe = window.self !== window.top; } catch (e) { inIframe = true; }
         if (inIframe) {
+            const frameHost = (window.location.hostname || '').toLowerCase();
+            const frameUrl = (window.location.href || '').toLowerCase();
+            if (frameHost.includes('challenges.cloudflare.com') ||
+                frameHost.includes('recaptcha.net') ||
+                frameHost.includes('hcaptcha.com') ||
+                frameUrl.includes('/turnstile/') ||
+                frameUrl.includes('/cdn-cgi/challenge-platform/')) {
+                // NEVER touch the DOM or install observers inside Captcha / Turnstile challenge iframes!
+                return;
+            }
             console.log('[KillURL] Iframe context — ritual-X watcher only');
             try { watchRitualModals(); } catch (e) { /* ignore */ }
             try { dismissInstructionModals({ aggressive: false, xOnly: true }); } catch (e) { /* ignore */ }
@@ -848,6 +960,26 @@
                 }
             });
 
+            window.addEventListener('killurl-destination-found', (e) => {
+                if (!isEnabled()) return;
+                const url = e.detail?.url;
+                if (url && isValidDestination(url)) {
+                    console.log('[KillURL] Destination link received from main world:', url);
+                    processCandidateDestination(url);
+                }
+            });
+
+            window.addEventListener('killurl-turnstile-solved', (e) => {
+                if (!isEnabled()) return;
+                console.log('[KillURL] Turnstile solved in main world');
+                renderSmartBar({
+                    step: 'MEDIAFIRE ACCESS',
+                    message: 'Turnstile verified! Unlocking MediaFire link...',
+                    icon: '⚡',
+                    isReady: false
+                });
+            });
+
             window.addEventListener('killurl-skip-done', () => {
                 if (!isEnabled()) return;
                 console.log('[KillURL] Skip completed — revealing elements');
@@ -864,11 +996,15 @@
             });
 
             window.addEventListener('killurl-security-page', (e) => {
-                console.log('[KillURL] Security page confirmed by injector — disabling');
-                isSecurityPage = true;
-                stopContinuousScanner();
-                if (e.detail?.aggressiveWatching) {
-                    console.log('[KillURL] Aggressive mode: waiting for CF to complete...');
+                if (isInterstitialSecurityPage()) {
+                    console.log('[KillURL] Security challenge confirmed by injector — disabling');
+                    isSecurityPage = true;
+                    stopContinuousScanner();
+                    if (e.detail?.aggressiveWatching) {
+                        console.log('[KillURL] Aggressive mode: waiting for CF to complete...');
+                    }
+                } else {
+                    console.log('[KillURL] Security notice received but page is active content — keeping scanner running');
                 }
             });
 
@@ -886,6 +1022,8 @@
                 maybeAutoSkip();
             });
         }
+
+        setupPrematureClickGuard();
 
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', onDOMReady);
@@ -947,14 +1085,20 @@
         if (hasCaptchaOrTurnstile() || isCaptchaShortenerDomain()) {
             console.log('[KillURL] Turnstile / Captcha detected on DOM ready — main world kept native');
             try {
-                window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'dom-ready-turnstile' } }));
+                window.dispatchEvent(new CustomEvent('killurl-turnstile-detected', { detail: { reason: 'dom-ready-turnstile' } }));
             } catch (e) { /* ignore */ }
         }
 
         // DETECTION only — no skipping
         detectShortenerPage();
+        setupPrematureClickGuard();
         setupMutationObserver();
         startContinuousScanner();
+        if (isPacedDomain()) {
+            startPacedStepController();
+        } else if (isCaptchaShortenerDomain()) {
+            startVplinkFinalController();
+        }
 
         // earnbox.in specific: watch for button changes more aggressively
         const hostname = window.location.hostname.replace(/^www\./, '');
@@ -984,7 +1128,7 @@
                 }
                 if (hasCaptchaOrTurnstile()) {
                     try {
-                        window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'interval-turnstile' } }));
+                        window.dispatchEvent(new CustomEvent('killurl-turnstile-detected', { detail: { reason: 'interval-turnstile' } }));
                     } catch (e) { /* ignore */ }
                 }
                 detectShortenerPage();
@@ -1048,18 +1192,85 @@
             checkCaptchaResolution();
             if (isSecurityPage && !settings.aggressiveMode) {
                 if (isCaptchaPending()) return;
-                stopContinuousScanner();
-                return;
+                if (isInterstitialSecurityPage()) {
+                    stopContinuousScanner();
+                    return;
+                }
+                isSecurityPage = false;
             }
 
             scanCount++;
             passiveScan();
 
+            // ACTIVE AUTO-ADVANCE FOR SHORTENER PAGES:
+            // When waiting on intermediate earn blogs / shortener steps:
+            // 1. If an initial verification button exists, click it to start the timer.
+            // 2. If countdown is actively ticking, wait for it to finish.
+            // 3. When countdown finishes, advance cleanly.
+            // Never auto-advance or force-click on captcha shortener domains (e.g. vplink.in)
+            if (!isCaptchaShortenerDomain() && !isFinalSite && !isProtectedSite) {
+                if (isPacedDomain()) {
+                    // Dedicated PacedStepController manages pacing, smart bar, and advancing
+                    return;
+                }
+                // Immediately dismiss deceptive ad overlays (e.g. #adOverlay on bcsakhi)
+                try {
+                    const adOverlay = document.getElementById('adOverlay');
+                    if (adOverlay) adOverlay.remove();
+                    const gcont = document.getElementById('gcont');
+                    if (gcont && gcont.style.position !== 'static') gcont.style.position = 'static';
+                } catch (e) { /* ignore */ }
+
+                patientScrollNudge();
+
+                // Check for initial verification / start button first
+                if (autoPressAllowed() && !unloading && !destinationUrl && !isCaptchaPending()) {
+                    if (clickInitialVerificationButton()) {
+                        return;
+                    }
+                }
+
+                // If countdown is actively ticking, wait and display remaining time
+                const rem = readCountdownValue();
+                if (rem != null && rem > 0) {
+                    updatePageHint('KillURL: countdown in progress (~' + rem + 's remaining)');
+                    return;
+                }
+
+                // On paced domains, if countdown has reached 0 or completed, ensure terminal buttons are unhidden
+                if (isPacedDomain()) {
+                    const cross = document.getElementById('cross-snp2');
+                    if (cross && cross.style.display === 'none') {
+                        const tEl = document.getElementById('link1s-time');
+                        const tVal = tEl ? parseInt(tEl.textContent, 10) : null;
+                        if ((tVal !== null && !isNaN(tVal) && tVal <= 0) || (rem != null && rem <= 0)) {
+                            cross.style.display = 'block';
+                        }
+                    }
+                    const tp = document.getElementById('tp-snp2');
+                    if (tp && tp.style.display === 'none') {
+                        const tEl = document.getElementById('tp-time');
+                        const tVal = tEl ? parseInt(tEl.textContent, 10) : null;
+                        if ((tVal !== null && !isNaN(tVal) && tVal <= 0) || (rem != null && rem <= 0)) {
+                            tp.style.display = 'block';
+                        }
+                    }
+                }
+
+                if (!countdownIsLive() && autoPressAllowed() && !unloading && !destinationUrl) {
+                    forceEnableButtons();
+                    if (!isCaptchaPending()) {
+                        clickContinueButton();
+                        submitTokenFormIfReady();
+                    }
+                }
+            }
+
             // Stop scanning after 2 minutes
-            if (scanCount > 120) {
+            if (scanCount > 400) {
                 stopContinuousScanner();
             }
-        }, 1000);
+        }, 300);
     }
 
     function stopContinuousScanner() {
@@ -1231,15 +1442,8 @@
         // EXCEPTION: proven-malleable hosts go instant — aged tokens make
         // elapsed time irrelevant, so the drive is safe again.
         if (patientMode && !hostMalleable) {
-            console.log('[KillURL] Server timer bypass auto-skip: rapid bypass cycle');
+            console.log('[KillURL] Server timer mode: waiting for authentic countdown completion');
             executePatientSkip();
-            [600, 1500, 3000].forEach(delay => {
-                setTimeout(() => {
-                    if (!isEnabled()) return;
-                    if (destinationUrl) return;
-                    executePatientSkip();
-                }, delay + (settings.skipDelay || 0));
-            });
             armAutopilot();
             return;
         }
@@ -1288,6 +1492,11 @@
                 if (!isEnabled()) return;
                 if (unloading || destinationUrl) return;
                 if (!autoPressAllowed()) return;
+                const rem = readCountdownValue();
+                if (((rem != null && rem > 0) || countdownIsLive()) && !settings.aggressiveMode) {
+                    console.log(`[KillURL] Auto-skip attempt ${index + 1} deferred — countdown actively running (~${rem}s remaining)`);
+                    return;
+                }
                 console.log(`[KillURL] Auto-skip attempt ${index + 1}/${attempts.length} (${gentle ? 'gentle' : 'full'})`);
                 if (gentle) {
                     executeGentleSkip();
@@ -1600,6 +1809,12 @@
             return;
         }
 
+        const activeRemaining = readCountdownValue();
+        if (((activeRemaining != null && activeRemaining > 0) || countdownIsLive()) && !settings.aggressiveMode) {
+            console.log(`[KillURL] Force-skip withheld — countdown is active (~${activeRemaining}s remaining). Waiting for natural completion to preserve authentic server timestamps.`);
+            return;
+        }
+
         if (isSecurityPage && settings.aggressiveMode) {
             console.log('[KillURL] Aggressive mode: forcing skip despite security page detection');
         }
@@ -1777,6 +1992,8 @@
     // soBtn-enabling scripts observe completion on their next tick.
     function forceCountdownTextToZero() {
         if (patientMode) return;
+        const rem = readCountdownValue();
+        if (((rem != null && rem > 0) || countdownIsLive()) && !settings.aggressiveMode) return;
         try {
             const els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6, strong, b, em, li, td');
             for (const el of els) {
@@ -2271,7 +2488,7 @@
                         enforceSameTabTarget(form);
                         if (btn) enforceSameTabTarget(btn);
                         unloading = true;
-                        suppressAutoPressUntil = Date.now() + 15000;
+                        suppressAutoPressUntil = Date.now() + 3000;
                         lastSubmitT = Date.now();
                         if (typeof form.requestSubmit === 'function') {
                             form.requestSubmit(btn);
@@ -2303,7 +2520,7 @@
                 enforceSameTabTarget(form);
                 if (btn) enforceSameTabTarget(btn);
                 unloading = true;
-                suppressAutoPressUntil = Date.now() + 15000;
+                suppressAutoPressUntil = Date.now() + 3000;
                 console.log('[KillURL] Auto-submitting token form...');
                 lastSubmitT = Date.now();
                 if (typeof form.requestSubmit === 'function') {
@@ -2326,7 +2543,7 @@
         try {
             const t = String(text || '').trim();
             if (!t) return null;
-            let m = t.match(/^(\d{1,3})$/);
+            let m = t.match(/^(-?\d{1,3})\s*(?:s|sec|seconds?)?$/i);
             if (m) return parseInt(m[1], 10);
             m = t.match(/(\d{1,3}):(\d{2})/);
             if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
@@ -2345,6 +2562,13 @@
     // timer-shaped is on screen. ("Step 1 of 6" parses to null on purpose.)
     function readCountdownValue() {
         try {
+            // If on a paced shortener domain and a terminal advance button (#cross-snp2 or #tp-snp2)
+            // is already visible, the page's countdown timer has ALREADY completed! Return 0.
+            const crossBtn = document.getElementById('cross-snp2');
+            if (crossBtn && isVisible(crossBtn)) return 0;
+            const tpBtn = document.getElementById('tp-snp2');
+            if (tpBtn && isVisible(tpBtn)) return 0;
+
             for (const selector of COUNTDOWN_SELECTORS) {
                 let el = null;
                 try { el = document.querySelector(selector); } catch (e) { continue; }
@@ -2352,10 +2576,15 @@
                     const text = (el.textContent || '').trim();
                     if (text && text.length < 40) {
                         const v = parseCountdownSeconds(text);
-                        if (v != null) return v;
+                        if (v != null) return Math.max(0, v);
                     }
                 }
             }
+
+            // If a pressable CTA button is already visible and enabled, do NOT fall back
+            // to searching bodyText (which matches static marketing banners like "WAIT 10 SECONDS TO GET LINK")!
+            if (hasPressableCTA()) return 0;
+
             const bodyText = document.body?.innerText || '';
             const pats = [
                 /please\s*wait[^\n]{0,40}/i,
@@ -2367,7 +2596,7 @@
                 const m = bodyText.match(p);
                 if (m) {
                     const v = parseCountdownSeconds(m[0]);
-                    if (v != null) return v;
+                    if (v != null) return Math.max(0, v);
                 }
             }
         } catch (e) { /* ignore */ }
@@ -2406,8 +2635,12 @@
             }
             if (v != null && v <= 0) return false; // reading zero = finished
             if (!sig) return false; // nothing timer-shaped here at all
-            // Wait-signal but no digits (still rendering?): hold briefly only.
-            if (v == null) return (now - firstSignalT) < WINDOW;
+            // Wait-signal but no digits (still rendering?): only hold briefly if NO CTA is ready.
+            // If a pressable CTA is already visible and enabled, let it proceed!
+            if (v == null) {
+                if (hasPressableCTA()) return false;
+                return (now - firstSignalT) < 3000;
+            }
             for (let i = 1; i < countHistory.length; i++) {
                 const a = countHistory[i - 1].v;
                 const b = countHistory[i].v;
@@ -2448,26 +2681,30 @@
         if (!isEnabled()) return;
         if (isProtectedSite || isFinalSite) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
-        console.log('[KillURL] Server timer bypass — speeding up page and prepping submission…');
+        console.log('[KillURL] Server timer mode — preparing clean advancement…');
         try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
-        revealHiddenElements();
         removeOverlays();
+        patientScrollNudge();
+        findDestinationUrl();
+
+        // If a countdown is actively running, DO NOT dispatch force-skip or fake zero
+        const rem = readCountdownValue();
+        if ((rem != null && rem > 0) || countdownIsLive()) {
+            console.log(`[KillURL] Server timer mode: countdown active (~${rem}s) — waiting for natural timer completion`);
+            waitForNaturalCompletionThenAdvance();
+            return;
+        }
+
+        revealHiddenElements();
         handleProgressBars();
         forceEnableButtons();
         forceCountdownTextToZero();
-        patientScrollNudge();
-        findDestinationUrl();
 
         // Age tokens on all forms immediately
         try {
             document.querySelectorAll('form').forEach(f => {
                 ageFormTokens(f, Date.now() - 60000, false);
             });
-        } catch (e) { /* ignore */ }
-
-        // Drive client timers forward via injector
-        try {
-            window.dispatchEvent(new CustomEvent('killurl-force-skip'));
         } catch (e) { /* ignore */ }
 
         waitForNaturalCompletionThenAdvance();
@@ -2479,11 +2716,19 @@
     let lastScrollNudge = 0;
     function patientScrollNudge() {
         try {
-            if (Date.now() - lastScrollNudge < 4000) return;
+            if (Date.now() - lastScrollNudge < 3500) return;
             const bodyText = document.body?.innerText || '';
-            if (!/scroll\s*(down\s*)?to\s*(continue|get|see|view|unlock|start)/i.test(bodyText)) return;
+            const scrollPrompt = /scroll\s*(down\s*)?to\s*(continue|get|see|view|unlock|start|proceed)/i.test(bodyText) ||
+                /scroll\s*down/i.test(bodyText) ||
+                /bottom\s*of\s*(the\s*)?page/i.test(bodyText);
+
+            // Also nudge scroll if sitting near top of page and waiting for CTA/timer
+            const needsScroll = scrollPrompt || (window.scrollY < 120 && (isShortenerPage || countdownDetected));
+            if (!needsScroll) return;
+
             lastScrollNudge = Date.now();
             window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+            try { window.dispatchEvent(new Event('scroll')); } catch (e) { /* ignore */ }
         } catch (e) { /* ignore */ }
     }
 
@@ -2543,6 +2788,7 @@
 
     function armAutopilot() {
         if (!isEnabled()) return;
+        if (isCaptchaShortenerDomain()) return;
         if (autopilotArmed) return;
         autopilotArmed = true;
         console.log('[KillURL] Autopilot armed — advancing chained steps automatically');
@@ -2574,7 +2820,8 @@
     let lastAutopilotClick = 0;
     function autopilotTick() {
         if (!isEnabled() || !autopilotArmed) return;
-        if (unloading) { disarmAutopilot(); return; }
+        if (isCaptchaShortenerDomain()) { disarmAutopilot(); return; }
+        if (unloading) return;
         if (isProtectedSite || isFinalSite) { disarmAutopilot(); return; }
         // Deadline gate: hold clicks/submits until the server-valid instant.
         // (Timer theater was already killed instantly — only the crossing waits.)
@@ -2661,12 +2908,9 @@
             try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (e) { /* */ }
             try { window.dispatchEvent(new CustomEvent('killurl-release-vars')); } catch (e) { /* */ }
 
-            // Auto-redirect ONLY if this is a verified authentic final destination and autoRedirect is enabled
-            if (isFinalDest && settings.autoRedirect) {
-                console.log('[KillURL] Auto-redirecting to final destination now:', destinationUrl);
-                try {
-                    window.location.href = destinationUrl;
-                } catch (e) { /* ignore */ }
+            if (isFinalDest) {
+                processCandidateDestination(candidate);
+                return true;
             }
             return true;
         }
@@ -2794,6 +3038,8 @@
 
     function revealHiddenElements() {
         if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return;
+        const rem = readCountdownValue();
+        if (((rem != null && rem > 0) || countdownIsLive()) && !settings.aggressiveMode) return;
         const allSelectors = [...HIDDEN_DURING_COUNTDOWN, ...DESTINATION_SELECTORS];
         const processed = new Set();
 
@@ -2830,6 +3076,8 @@
 
     function forceEnableButtons() {
         if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return;
+        const rem = readCountdownValue();
+        if (((rem != null && rem > 0) || countdownIsLive()) && !settings.aggressiveMode) return;
         document.querySelectorAll('a, button, input[type="submit"], input[type="button"], [role="button"]').forEach(el => {
             const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
             if (!text) return;
@@ -2887,6 +3135,14 @@
         // whole step; full interference allowed here — skip-flow context).
         try { dismissInstructionModals({ aggressive: true }); } catch (e) { /* ignore */ }
         try { handleAdGateOverlays({ aggressive: true }); } catch (e) { /* ignore */ }
+        // Immediately eliminate deceptive ad overlays (e.g. bcsakhi's #adOverlay)
+        try {
+            const adOverlay = document.getElementById('adOverlay');
+            if (adOverlay) adOverlay.remove();
+            const gcont = document.getElementById('gcont');
+            if (gcont && gcont.style.position !== 'static') gcont.style.position = 'static';
+        } catch (e) { /* ignore */ }
+
         const overlaySelectors = [
             '#overlay', '.overlay', '#ad-overlay', '.ad-overlay',
             '.modal-backdrop', '#modal-backdrop',
@@ -2898,6 +3154,7 @@
         overlaySelectors.forEach(selector => {
             try {
                 document.querySelectorAll(selector).forEach(el => {
+                    if (el.id === 'gcont' || el.closest('#gcont')) return;
                     if (el.querySelector('a[href], button, input[type="submit"]')) {
                         el.style.setProperty('background', 'transparent', 'important');
                     } else {
@@ -3529,52 +3786,899 @@
         return true;
     }
 
-    // Small in-page notice (own shadow-free div, auto-removed). Used when the
-    // timer is dead but the final press needs a human (trusted-event gates).
-    function showPageHint(text) {
+    // ===== SMART PROCESS BAR & PACED STEP CONTROLLER =====
+
+    function ensureSmartBarStyles() {
+        if (document.getElementById('killurl-smart-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'killurl-smart-styles';
+        style.textContent = `
+            #killurl-smart-bar {
+                position: fixed !important;
+                bottom: 24px !important;
+                left: 50% !important;
+                transform: translateX(-50%) !important;
+                background: rgba(15, 23, 42, 0.94) !important;
+                backdrop-filter: blur(16px) !important;
+                -webkit-backdrop-filter: blur(16px) !important;
+                border: 1px solid rgba(56, 189, 248, 0.35) !important;
+                box-shadow: 0 10px 32px rgba(0, 0, 0, 0.65), 0 0 20px rgba(56, 189, 248, 0.25) !important;
+                border-radius: 9999px !important;
+                padding: 8px 16px !important;
+                display: flex !important;
+                align-items: center !important;
+                gap: 10px !important;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+                font-size: 13px !important;
+                color: #f1f5f9 !important;
+                z-index: 2147483647 !important;
+                user-select: none !important;
+                pointer-events: auto !important;
+                cursor: default !important;
+                transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, border-color 0.2s ease !important;
+                line-height: 1.4 !important;
+                overflow: hidden !important;
+                max-width: 90vw !important;
+            }
+            #killurl-smart-bar:hover {
+                transform: translateX(-50%) scale(1.02) !important;
+                box-shadow: 0 12px 36px rgba(0, 0, 0, 0.75), 0 0 25px rgba(56, 189, 248, 0.35) !important;
+            }
+            #killurl-smart-bar.ku-success {
+                border-color: rgba(34, 197, 94, 0.6) !important;
+                box-shadow: 0 10px 32px rgba(0, 0, 0, 0.75), 0 0 25px rgba(34, 197, 94, 0.4) !important;
+            }
+            .ku-icon-wrap {
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 22px !important;
+                height: 22px !important;
+                border-radius: 50% !important;
+                background: rgba(56, 189, 248, 0.15) !important;
+                font-size: 13px !important;
+                flex-shrink: 0 !important;
+                animation: ku-pulse 2s infinite ease-in-out !important;
+            }
+            @keyframes ku-pulse {
+                0%, 100% { transform: scale(1); opacity: 1; }
+                50% { transform: scale(1.15); opacity: 0.85; }
+            }
+            .ku-step-pill {
+                background: rgba(56, 189, 248, 0.18) !important;
+                color: #38bdf8 !important;
+                border: 1px solid rgba(56, 189, 248, 0.35) !important;
+                font-size: 10.5px !important;
+                font-weight: 700 !important;
+                letter-spacing: 0.6px !important;
+                text-transform: uppercase !important;
+                padding: 2px 7px !important;
+                border-radius: 6px !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+            }
+            #killurl-smart-bar.ku-success .ku-step-pill {
+                background: rgba(34, 197, 94, 0.2) !important;
+                color: #4ade80 !important;
+                border-color: rgba(34, 197, 94, 0.4) !important;
+            }
+            .ku-msg-text {
+                color: #f8fafc !important;
+                font-weight: 500 !important;
+                font-size: 12.5px !important;
+                white-space: nowrap !important;
+            }
+            .ku-timer-pill {
+                background: rgba(245, 158, 11, 0.15) !important;
+                color: #fbbf24 !important;
+                border: 1px solid rgba(245, 158, 11, 0.35) !important;
+                font-size: 11.5px !important;
+                font-weight: 700 !important;
+                font-variant-numeric: tabular-nums !important;
+                padding: 2px 8px !important;
+                border-radius: 9999px !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+                transition: all 0.2s ease !important;
+            }
+            .ku-timer-pill.ready {
+                background: rgba(34, 197, 94, 0.2) !important;
+                color: #4ade80 !important;
+                border-color: rgba(34, 197, 94, 0.4) !important;
+            }
+            .ku-dest-btn {
+                background: linear-gradient(135deg, #10b981, #059669) !important;
+                color: #ffffff !important;
+                font-size: 12px !important;
+                font-weight: 700 !important;
+                padding: 4px 12px !important;
+                border-radius: 9999px !important;
+                text-decoration: none !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                gap: 5px !important;
+                box-shadow: 0 0 12px rgba(16, 185, 129, 0.5) !important;
+                cursor: pointer !important;
+                transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+            }
+            .ku-dest-btn:hover {
+                transform: scale(1.05) !important;
+                box-shadow: 0 0 18px rgba(16, 185, 129, 0.8) !important;
+                color: #ffffff !important;
+            }
+            .ku-url-pill {
+                background: rgba(255, 255, 255, 0.08) !important;
+                color: #94a3b8 !important;
+                border: 1px solid rgba(255, 255, 255, 0.15) !important;
+                font-size: 11px !important;
+                padding: 2px 8px !important;
+                border-radius: 6px !important;
+                cursor: pointer !important;
+                max-width: 220px !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+                white-space: nowrap !important;
+                transition: all 0.2s ease !important;
+                flex-shrink: 1 !important;
+            }
+            .ku-url-pill:hover {
+                background: rgba(255, 255, 255, 0.15) !important;
+                color: #f1f5f9 !important;
+                border-color: rgba(56, 189, 248, 0.4) !important;
+            }
+            .ku-dest-btn.ku-dead-btn {
+                background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+                box-shadow: 0 0 10px rgba(245, 158, 11, 0.4) !important;
+            }
+            .ku-dest-btn.ku-dead-btn:hover {
+                box-shadow: 0 0 16px rgba(245, 158, 11, 0.7) !important;
+            }
+            #killurl-smart-bar.ku-warning-bar {
+                border-color: rgba(245, 158, 11, 0.4) !important;
+                box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 0 20px rgba(245, 158, 11, 0.25) !important;
+            }
+            .ku-progress-line {
+                position: absolute !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                height: 2px !important;
+                background: linear-gradient(90deg, #38bdf8, #818cf8, #34d399) !important;
+                transition: width 0.3s ease !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function renderSmartBar({ step, message, remaining, total, icon, isReady, destinationUrl, buttonText, noAutoRedirect }) {
         try {
-            if (document.getElementById('killurl-hint')) return;
-            const div = document.createElement('div');
-            div.id = 'killurl-hint';
-            div.textContent = text;
-            div.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);' +
-                'background:#111128;color:#34d399;font:600 13px system-ui,sans-serif;' +
-                'padding:10px 18px;border-radius:10px;border:1px solid rgba(52,211,153,.4);' +
-                'box-shadow:0 4px 24px rgba(0,0,0,.5);z-index:2147483647;cursor:pointer;';
-            div.addEventListener('click', () => div.remove());
-            document.documentElement.appendChild(div);
-            try { div._kuT = setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 9000); } catch (e) { /* ignore */ }
+            ensureSmartBarStyles();
+            let bar = document.getElementById('killurl-smart-bar');
+            if (!bar) {
+                bar = document.createElement('div');
+                bar.id = 'killurl-smart-bar';
+                bar.innerHTML = `
+                    <div class="ku-icon-wrap"><span class="ku-icon">⚡</span></div>
+                    <div class="ku-step-pill">KILLURL</div>
+                    <div class="ku-msg-text">Processing...</div>
+                    <div class="ku-timer-pill"></div>
+                    <div class="ku-progress-line" style="width: 0%;"></div>
+                `;
+                document.documentElement.appendChild(bar);
+            }
+
+            const iconEl = bar.querySelector('.ku-icon');
+            const stepEl = bar.querySelector('.ku-step-pill');
+            const msgEl = bar.querySelector('.ku-msg-text');
+            const timerEl = bar.querySelector('.ku-timer-pill');
+            const progEl = bar.querySelector('.ku-progress-line');
+
+            if (iconEl) iconEl.textContent = icon || '⚡';
+            if (stepEl) stepEl.textContent = step || 'KILLURL';
+            if (msgEl) msgEl.textContent = message || '';
+
+            if (destinationUrl) {
+                bar.classList.add('ku-success');
+                if (noAutoRedirect) {
+                    bar.classList.add('ku-warning-bar');
+                } else {
+                    bar.classList.remove('ku-warning-bar');
+                }
+                let destEl = bar.querySelector('.ku-dest-btn');
+                if (!destEl) {
+                    destEl = document.createElement('a');
+                    destEl.className = 'ku-dest-btn';
+                    destEl.target = '_blank';
+                    destEl.rel = 'noopener noreferrer';
+                    destEl.addEventListener('click', (ev) => {
+                        ev.preventDefault();
+                        unloading = true;
+                        window.location.href = destEl.href;
+                    });
+                    bar.appendChild(destEl);
+                }
+                destEl.href = destinationUrl;
+                destEl.textContent = buttonText || '⬇️ Open Download';
+                if (noAutoRedirect) {
+                    destEl.classList.add('ku-dead-btn');
+                } else {
+                    destEl.classList.remove('ku-dead-btn');
+                }
+                destEl.style.display = 'inline-flex';
+
+                let urlPill = bar.querySelector('.ku-url-pill');
+                if (!urlPill) {
+                    urlPill = document.createElement('span');
+                    urlPill.className = 'ku-url-pill';
+                    urlPill.addEventListener('click', (ev) => {
+                        ev.stopPropagation();
+                        try {
+                            navigator.clipboard.writeText(destinationUrl).then(() => {
+                                urlPill.textContent = 'Copied to clipboard!';
+                                setTimeout(() => { urlPill.textContent = destinationUrl; }, 1500);
+                            }).catch(() => {});
+                        } catch (e) {}
+                    });
+                    bar.appendChild(urlPill);
+                }
+                urlPill.textContent = destinationUrl;
+                urlPill.title = 'Click to copy: ' + destinationUrl;
+                urlPill.style.display = 'inline-block';
+            }
+
+            if (timerEl) {
+                if (typeof remaining === 'number') {
+                    timerEl.textContent = (destinationUrl && !noAutoRedirect)
+                        ? `Auto-redirect in ${Math.max(0, remaining)}s`
+                        : `${Math.max(0, remaining)}s remaining`;
+                    timerEl.classList.toggle('ready', remaining <= 0);
+                    timerEl.style.display = 'inline-block';
+                } else if (remaining) {
+                    timerEl.textContent = remaining;
+                    timerEl.classList.remove('ready');
+                    timerEl.style.display = 'inline-block';
+                } else if (isReady) {
+                    timerEl.textContent = 'Ready! 🚀';
+                    timerEl.classList.add('ready');
+                    timerEl.style.display = 'inline-block';
+                } else {
+                    timerEl.style.display = 'none';
+                }
+            }
+
+            if (progEl) {
+                if (typeof remaining === 'number' && typeof total === 'number' && total > 0) {
+                    const pct = Math.max(0, Math.min(100, Math.round(((total - remaining) / total) * 100)));
+                    progEl.style.width = pct + '%';
+                } else if (destinationUrl || isReady) {
+                    progEl.style.width = '100%';
+                }
+            }
+
+            if (bar._kuT) clearTimeout(bar._kuT);
+            bar._kuT = setTimeout(() => {
+                try { bar.remove(); } catch (e) { /* ignore */ }
+            }, 30000);
         } catch (e) { /* ignore */ }
     }
 
-    // Live-update the in-page hint (creates it if missing, refreshes the
-    // 9s auto-remove timer by re-creating when stale). Used for the
-    // gate countdown readout — polled every second, so keep it cheap.
-    function updatePageHint(text) {
+    let destCountdownActive = false;
+    let destCountdownInterval = null;
+    let verifyingUrl = null;
+
+    function handleAuthenticDestinationCaptured(url) {
+        if (destCountdownActive) return;
+        destCountdownActive = true;
+        destinationUrl = url;
+
+        try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (err) { /* */ }
+
+        let secondsRemaining = 20;
+        const totalSeconds = 20;
+
+        const updateBar = () => {
+            renderSmartBar({
+                step: url.includes('mediafire.com') ? 'MEDIAFIRE READY' : 'DOWNLOAD READY',
+                message: 'Authentic download link unlocked!',
+                icon: '🎉',
+                isReady: true,
+                destinationUrl: url,
+                remaining: secondsRemaining,
+                total: totalSeconds,
+                buttonText: url.includes('mediafire.com') ? '⬇️ Download File (MediaFire)' : '⬇️ Open Download'
+            });
+        };
+
+        updateBar();
+
+        if (destCountdownInterval) clearInterval(destCountdownInterval);
+        destCountdownInterval = setInterval(() => {
+            secondsRemaining--;
+            if (secondsRemaining <= 0) {
+                clearInterval(destCountdownInterval);
+                destCountdownInterval = null;
+                if (settings.autoRedirect !== false && !unloading) {
+                    unloading = true;
+                    window.location.href = url;
+                }
+            } else {
+                updateBar();
+            }
+        }, 1000);
+    }
+
+    function handleDeadDestinationCaptured(url, reason) {
+        if (destCountdownActive) return;
+        destCountdownActive = true;
+        destinationUrl = url;
+
+        let secondsRemaining = 20;
+        const totalSeconds = 20;
+        const is320 = reason === 'file_deleted_320' || (typeof url === 'string' && (url.includes('320') || url.includes('error.php')));
+
+        const updateBar = () => {
+            renderSmartBar({
+                step: is320 ? 'FILE DELETED (320)' : 'DEAD LINK (404)',
+                message: is320
+                    ? '⚠️ MediaFire Error 320: File deleted by uploader. Auto-redirect blocked.'
+                    : '⚠️ Destination file expired or missing on server. Auto-redirect blocked.',
+                icon: '⚠️',
+                isReady: false,
+                destinationUrl: url,
+                noAutoRedirect: true,
+                remaining: secondsRemaining,
+                total: totalSeconds,
+                buttonText: is320 ? 'Open MediaFire Anyway' : 'Open Link Anyway'
+            });
+        };
+
+        updateBar();
+
+        if (destCountdownInterval) clearInterval(destCountdownInterval);
+        destCountdownInterval = setInterval(() => {
+            secondsRemaining--;
+            if (secondsRemaining <= 0) {
+                clearInterval(destCountdownInterval);
+                destCountdownInterval = null;
+                // Never auto-redirect to a dead link! Keep the bar visible with the link pill copyable.
+            } else {
+                updateBar();
+            }
+        }, 1000);
+    }
+
+    function processCandidateDestination(rawUrl) {
+        if (!rawUrl) return;
+        const url = rawUrl.trim();
+        if (!url || url.includes('javascript:') || destCountdownActive) return;
+
+        // 1. Synchronous check: reject known error destination patterns (honeypots, error pages, dead suffixes)
+        if (isErrorDestination(url)) {
+            console.log('[KillURL] Candidate URL is an error/honeypot destination, rejected from capture:', url);
+            // Never capture error/decoy links — user requested: do not capture if error!
+            return;
+        }
+
+        if (verifyingUrl === url) return;
+        verifyingUrl = url;
+
+        // 2. Pre-flight health check via background service worker
+        renderSmartBar({
+            step: 'VERIFYING FILE',
+            message: 'Verifying file authenticity on server...',
+            icon: '🔍',
+            isReady: false
+        });
+
         try {
-            let div = document.getElementById('killurl-hint');
-            if (!div) { showPageHint(text); return; }
-            if (div.textContent !== text) div.textContent = text;
-            // Re-arm the auto-remove timer so a live readout never flickers out.
-            try {
-                if (div._kuT) clearTimeout(div._kuT);
-                div._kuT = setTimeout(() => { try { div.remove(); } catch (e) { /* ignore */ } }, 9000);
-            } catch (e) { /* ignore */ }
+            chrome.runtime.sendMessage({ type: 'CHECK_URL_HEALTH', url }, (res) => {
+                verifyingUrl = null;
+                if (chrome.runtime.lastError || !res) {
+                    handleAuthenticDestinationCaptured(url);
+                    return;
+                }
+
+                if (res.valid === false) {
+                    console.log('[KillURL] Destination health check failed (error/dead file):', res);
+                    // Do not capture dead/corrupted links
+                    return;
+                }
+
+                // Authentic alive link confirmed!
+                const liveUrl = res.finalUrl || url;
+                handleAuthenticDestinationCaptured(liveUrl);
+            });
+        } catch (e) {
+            verifyingUrl = null;
+            handleAuthenticDestinationCaptured(url);
+        }
+    }
+
+    function showPageHint(text) {
+        updatePageHint(text);
+    }
+
+    function updatePageHint(text) {
+        if (!text) return;
+        renderSmartBar({
+            step: 'KILLURL',
+            message: text,
+            icon: '⚡'
+        });
+    }
+
+    let pacedControllerStarted = false;
+    let pacedAdvanceExecuted = false;
+
+    async function startPacedStepController() {
+        if (!isEnabled()) return;
+        if (!isPacedDomain()) return;
+        if (pacedControllerStarted) return;
+
+        // Skip gateway redirect query pages (they navigate automatically in 0s)
+        const search = window.location.search || '';
+        if (search.includes('insurancesstudy=') || search.includes('educationsuniversities=') || search.includes('educationstudies=')) {
+            console.log('[KillURL] Gateway redirect page — waiting for automatic article navigation');
+            return;
+        }
+
+        pacedControllerStarted = true;
+        console.log('[KillURL] Paced Step Controller initialized on:', window.location.href);
+
+        const host = window.location.hostname.replace(/^www\./, '').toLowerCase();
+        const isStep3 = host.includes('bcsakhi') ||
+                        host.includes('educatestudies') ||
+                        !!document.querySelector('a[href*="/educatestudies/learn_more.php"]');
+
+        // Pre-seed shortcut cookies without destroying blog session tracking:
+        try {
+            if (isStep3) {
+                if (!document.cookie.includes('adcadg=')) {
+                    document.cookie = 'adcadg=insurance,online_colleges,study_abroad,finance,loan; path=/; max-age=3600';
+                }
+                try {
+                    window.specialActionHandler = function() { return true; };
+                } catch (e) {}
+            } else {
+                if (!document.cookie.includes('_uocat=')) {
+                    document.cookie = '_uocat=value; path=/; max-age=86400';
+                }
+            }
         } catch (e) { /* ignore */ }
+
+        // Remove deceptive overlays
+        try {
+            const adOverlay = document.getElementById('adOverlay');
+            if (adOverlay) adOverlay.remove();
+            const gcont = document.getElementById('gcont');
+            if (gcont && gcont.style.position !== 'static') gcont.style.position = 'static';
+        } catch (e) { /* ignore */ }
+
+        // Determine step index
+        let stepNum = 1;
+        let stepText = 'STEP 1/3';
+        if (isStep3) {
+            stepNum = 3;
+            stepText = 'FINAL STEP 3/3';
+        } else {
+            const hasStep2Signals = window.location.search.includes('educationsuniversities') ||
+                                    !!document.getElementById('btn6') ||
+                                    !!document.getElementById('btn7') ||
+                                    !!document.getElementById('ce-wait1') ||
+                                    !!document.getElementById('ce-time') ||
+                                    (document.documentElement && document.documentElement.innerHTML.includes('nextbtn()'));
+            if (hasStep2Signals) {
+                stepNum = 2;
+                stepText = 'STEP 2/3';
+            } else {
+                try {
+                    const chainInfo = await chrome.runtime.sendMessage({ type: 'GET_CHAIN_ELAPSED' });
+                    if (chainInfo && chainInfo.step === 2) {
+                        stepNum = 2;
+                        stepText = 'STEP 2/3';
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
+
+        function findPacedAdvanceButton(sNum) {
+            if (sNum === 2) {
+                return document.getElementById('btn1') ||
+                       document.getElementById('btn7') ||
+                       document.getElementById('btn6') ||
+                       document.querySelector('a[href*="learn_more.php"], button#btn1');
+            }
+            if (sNum === 3) {
+                return document.getElementById('tp-snp2') ||
+                       document.getElementById('cross-snp2') ||
+                       document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61, a[href*="learn_more.php"]');
+            }
+            return document.getElementById('tp-snp2') ||
+                   document.getElementById('cross-snp2') ||
+                   document.querySelector('button.button-61, button#tp-snp2, .button-61, a[href*="learn_more.php"]');
+        }
+
+        const detectedWait = readCountdownValue();
+        let targetDuration = (detectedWait != null && detectedWait > 0) ? detectedWait : 10;
+        let remainingSec = targetDuration;
+        let totalSec = targetDuration;
+
+        const initialMsg = (stepNum === 3)
+            ? 'Securing authentic MediaFire download link...'
+            : (stepNum === 2 ? 'Verifying Step 2 (Article 2 of 3)...' : 'Verifying Step 1 (Waiting for secure link validation)...');
+        const initialIcon = (stepNum === 3) ? '🔒' : '⚡';
+
+        renderSmartBar({
+            step: stepText,
+            message: initialMsg,
+            remaining: remainingSec,
+            total: totalSec,
+            icon: initialIcon,
+            isReady: false
+        });
+
+        // 1-second active ticker loop in sync with real page timer
+        const pacedInterval = setInterval(async () => {
+            if (!isEnabled() || unloading) {
+                clearInterval(pacedInterval);
+                return;
+            }
+
+            // Sync with actual page timer if detected
+            const pageRem = readCountdownValue();
+            if (pageRem != null && pageRem > 0) {
+                if (pageRem > totalSec) totalSec = pageRem;
+                remainingSec = pageRem;
+            } else if (remainingSec > 0) {
+                remainingSec--;
+            }
+
+            const btnReady = !!findPacedAdvanceButton(stepNum);
+
+            if (remainingSec <= 0 || (btnReady && remainingSec <= 1)) {
+                clearInterval(pacedInterval);
+                const doneMsg = (stepNum === 3)
+                    ? 'MediaFire link secured! Unlocking final destination...'
+                    : (stepNum === 2 ? 'Step 2 cleared! Auto-clicking Continue...' : 'Timer complete! Auto-clicking Continue...');
+                const doneIcon = (stepNum === 3) ? '✅' : '🚀';
+
+                renderSmartBar({
+                    step: stepText,
+                    message: doneMsg,
+                    remaining: 0,
+                    total: totalSec,
+                    icon: doneIcon,
+                    isReady: true
+                });
+
+                setTimeout(() => {
+                    executePacedStepAdvance(stepNum);
+                }, 200);
+                return;
+            }
+
+            const stepMsg = (stepNum === 3)
+                ? 'Securing authentic MediaFire download link...'
+                : (stepNum === 2 ? 'Verifying Step 2 (Article 2 of 3)...' : 'Verifying Step 1 (Waiting for secure link validation)...');
+
+            renderSmartBar({
+                step: stepText,
+                message: stepMsg,
+                remaining: Math.max(0, remainingSec),
+                total: totalSec,
+                icon: (stepNum === 3) ? '🔒' : '⚡',
+                isReady: false
+            });
+        }, 1000);
+    }
+
+    async function executePacedStepAdvance(stepNum) {
+        if (pacedAdvanceExecuted) return;
+        pacedAdvanceExecuted = true;
+        unloading = true;
+
+        console.log(`[KillURL] Advancing paced step ${stepNum}...`);
+
+        try {
+            await chrome.runtime.sendMessage({ type: 'ADVANCE_CHAIN_STEP' });
+        } catch (e) { /* ignore */ }
+
+        // Pre-seed shortcut cookies without destroying blog session tracking:
+        try {
+            if (stepNum === 3 || window.location.hostname.includes('bcsakhi') || window.location.hostname.includes('educatestudies')) {
+                if (!document.cookie.includes('adcadg=')) {
+                    document.cookie = 'adcadg=insurance,online_colleges,study_abroad,finance,loan; path=/; max-age=3600';
+                }
+            } else {
+                if (!document.cookie.includes('_uocat=')) {
+                    document.cookie = '_uocat=value; path=/; max-age=86400';
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        if (stepNum === 2) {
+            const btn6 = document.getElementById('btn6');
+            if (btn6) {
+                btn6.style.setProperty('display', 'block', 'important');
+                btn6.style.setProperty('visibility', 'visible', 'important');
+                btn6.removeAttribute('disabled');
+                try { dispatchFullClickSequence(btn6); } catch (e) {}
+            }
+            if (typeof window.nextbtn === 'function') {
+                try { window.nextbtn(); } catch (e) {}
+            }
+            const btn7 = document.getElementById('btn7');
+            if (btn7) {
+                btn7.style.setProperty('display', 'block', 'important');
+                btn7.style.setProperty('visibility', 'visible', 'important');
+                btn7.style.setProperty('opacity', '1', 'important');
+                btn7.removeAttribute('disabled');
+                try { dispatchFullClickSequence(btn7); } catch (e) {}
+            }
+        }
+
+        // Find primary advance button & anchor
+        let btn = (stepNum === 2)
+            ? (document.getElementById('btn1') || document.querySelector('a[href*="/studyeducates/learn_more.php"], button#btn1'))
+            : (document.getElementById('tp-snp2') || document.getElementById('cross-snp2') || document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61'));
+
+        let anchor = btn?.tagName === 'A' ? btn : (btn?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"]'));
+
+        if (btn) {
+            btn.style.setProperty('display', 'block', 'important');
+            btn.style.setProperty('visibility', 'visible', 'important');
+            btn.style.setProperty('opacity', '1', 'important');
+            btn.style.setProperty('pointer-events', 'auto', 'important');
+            btn.style.setProperty('z-index', '999999', 'important');
+            btn.removeAttribute('disabled');
+        }
+        if (anchor) {
+            anchor.style.setProperty('display', 'block', 'important');
+            anchor.style.setProperty('visibility', 'visible', 'important');
+            anchor.target = '_self';
+        }
+
+        try {
+            if (anchor) dispatchFullClickSequence(anchor);
+            if (btn && btn !== anchor) dispatchFullClickSequence(btn);
+        } catch (e) { /* ignore */ }
+
+        const navFrom = window.location.href;
+        setTimeout(() => {
+            try {
+                if (window.location.href === navFrom) {
+                    const dest = anchor?.getAttribute('href') || (stepNum === 3 ? '/educatestudies/learn_more.php' : '/studyeducates/learn_more.php');
+                    if (dest && !dest.startsWith('#') && !dest.startsWith('javascript:')) {
+                        const resolved = new URL(dest, window.location.href).href;
+                        console.log(`[KillURL] Step ${stepNum} fallback navigation to:`, resolved);
+                        window.location.href = resolved;
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }, 1000);
+    }
+
+    let vplinkFinalStarted = false;
+    // No more MAIN world event listener for killurl-aro-setup — page runs natively.
+    // We use a fixed 10s assumption (AroShield default) since we can't intercept the setup call.
+    const VPLINK_WAIT_SEC = 10;
+
+    function startVplinkFinalController() {
+        if (!isEnabled()) return;
+        if (vplinkFinalStarted) return;
+        vplinkFinalStarted = true;
+
+        const vplinkStartT = Date.now();
+        console.log('[KillURL] Vplink Final Controller (zero-fingerprint mode) on:', window.location.href);
+
+        renderSmartBar({
+            step: 'MEDIAFIRE ACCESS',
+            message: 'Page running natively — waiting for Turnstile & timer...',
+            remaining: VPLINK_WAIT_SEC,
+            total: VPLINK_WAIT_SEC,
+            icon: '🛡️',
+            isReady: false
+        });
+
+        // Comprehensive selector list for destination buttons/links on vplink
+        const DEST_SELECTORS = [
+            '#get-link', 'a.get-link', 'a#getlink', '#btn-main', 'a.btn-main',
+            '#getlink', '.getlink', 'a#get-link', 'a.getlink',
+            'a[href*="mediafire.com"]', 'a[href*="mega.nz"]', 'a[href*="drive.google.com"]',
+            'a[href*="gofile.io"]', 'a[href*="pixeldrain.com"]'
+        ];
+
+        function scanForDestinationLink() {
+            for (const sel of DEST_SELECTORS) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const href = (el.getAttribute('href') || '').trim();
+                        if (href && !href.includes('javascript:') && !href.startsWith('#') &&
+                            !href.includes(window.location.hostname) &&
+                            /^https?:\/\//i.test(href)) {
+                            return href;
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+            // Also scan all anchors for any final destination link
+            try {
+                const allAnchors = document.querySelectorAll('a[href]');
+                for (const a of allAnchors) {
+                    const href = (a.getAttribute('href') || '').trim();
+                    if (!href || href.startsWith('#') || href.startsWith('javascript:')) continue;
+                    if (href.includes(window.location.hostname)) continue;
+                    if (/^https?:\/\//i.test(href) && isValidDestination(href)) {
+                        return href;
+                    }
+                }
+            } catch (e) { /* ignore */ }
+            return null;
+        }
+
+        // Watch for navigation away from vplink (page redirecting to destination)
+        let navigationCaptured = false;
+        try {
+            window.addEventListener('beforeunload', () => {
+                navigationCaptured = true;
+            });
+        } catch (e) { /* ignore */ }
+
+        let pollCount = 0;
+        const vplinkPoll = setInterval(() => {
+            if (!isEnabled() || unloading) {
+                clearInterval(vplinkPoll);
+                return;
+            }
+            pollCount++;
+
+            const elapsedSec = Math.floor((Date.now() - vplinkStartT) / 1000);
+            const remainingSec = Math.max(0, VPLINK_WAIT_SEC - elapsedSec);
+
+            // 1. Scan DOM for destination link
+            const foundHref = scanForDestinationLink();
+            if (foundHref && !isErrorDestination(foundHref)) {
+                clearInterval(vplinkPoll);
+                console.log('[KillURL] Authentic destination found on vplink (DOM scan):', foundHref);
+                processCandidateDestination(foundHref);
+                return;
+            }
+
+            // 2. Check for Turnstile solved token (readable from isolated world)
+            const hasTurnstile = hasSolvedCaptchaToken();
+
+            if (!hasTurnstile) {
+                renderSmartBar({
+                    step: 'MEDIAFIRE ACCESS',
+                    message: 'Verifying Cloudflare Turnstile...',
+                    remaining: remainingSec,
+                    total: VPLINK_WAIT_SEC,
+                    icon: '🛡️',
+                    isReady: false
+                });
+            } else if (remainingSec > 0) {
+                renderSmartBar({
+                    step: 'MEDIAFIRE ACCESS',
+                    message: 'Turnstile verified! Server timer counting down...',
+                    remaining: remainingSec,
+                    total: VPLINK_WAIT_SEC,
+                    icon: '⏳',
+                    isReady: false
+                });
+            } else {
+                // Timer elapsed + Turnstile verified
+                renderSmartBar({
+                    step: 'MEDIAFIRE ACCESS',
+                    message: 'Timer complete! Securing authentic MediaFire link...',
+                    remaining: 0,
+                    total: VPLINK_WAIT_SEC,
+                    icon: '🚀',
+                    isReady: true
+                });
+
+                // Check if Get Link button has become clickable and trigger it naturally
+                const ctaBtn = document.getElementById('get-link') ||
+                               document.querySelector('a.get-link, a#getlink, #btn-main, a.btn-main, button#get-link');
+                if (ctaBtn && !ctaBtn.hasAttribute('disabled') && !ctaBtn.classList.contains('disabled')) {
+                    const ctaHref = (ctaBtn.getAttribute('href') || ctaBtn.href || '').trim();
+                    if (ctaHref && isValidDestination(ctaHref) && !isErrorDestination(ctaHref)) {
+                        clearInterval(vplinkPoll);
+                        console.log('[KillURL] Authentic destination ready on CTA:', ctaHref);
+                        processCandidateDestination(ctaHref);
+                        return;
+                    }
+                    try {
+                        dispatchFullClickSequence(ctaBtn);
+                    } catch (e) {
+                        try { ctaBtn.click(); } catch (e2) {}
+                    }
+                }
+            }
+
+            // After 60 seconds, the page should have completed. Stop polling.
+            if (pollCount >= 120) {
+                clearInterval(vplinkPoll);
+            }
+        }, 500);
+
+        // Additionally, set up a MutationObserver to catch the destination link the moment it appears
+        try {
+            const observer = new MutationObserver((mutations) => {
+                const href = scanForDestinationLink();
+                if (href && !isErrorDestination(href)) {
+                    observer.disconnect();
+                    clearInterval(vplinkPoll);
+                    console.log('[KillURL] Authentic destination found on vplink (MutationObserver):', href);
+                    processCandidateDestination(href);
+                }
+            });
+            observer.observe(document.documentElement || document.body || document, {
+                childList: true, subtree: true, attributes: true, attributeFilter: ['href']
+            });
+            // Auto-disconnect after 90s
+            setTimeout(() => { try { observer.disconnect(); } catch (e) {} }, 90000);
+        } catch (e) { /* ignore */ }
+    }
+
+    let lastInitialBtnClickT = 0;
+    function clickInitialVerificationButton() {
+        if (!isEnabled()) return false;
+        if (isProtectedSite || isFinalSite) return false;
+        if (isCaptchaShortenerDomain()) return false;
+        if (isSecurityPage && !settings.aggressiveMode) return false;
+        if (isCaptchaPending()) return false;
+        if (Date.now() - lastInitialBtnClickT < 1500) return false;
+
+        const triggerSelectors = [
+            '#startCountdownBtn', '.start-countdown-btn', 'button#startCountdownBtn',
+            '#cross-snp', '#tp-snp',
+            '#start-btn', '.start-btn', '#start-timer', '#start-countdown',
+            '#verify-now', '.verify-now', '#btn-verify', '.btn-verify',
+            'button[id*="startCountdown" i]', 'button[class*="start-countdown" i]',
+            'button[id*="start-countdown" i]', 'button[class*="start-countdown" i]'
+        ];
+
+        for (const selector of triggerSelectors) {
+            try {
+                const btn = document.querySelector(selector);
+                if (btn && isVisible(btn) && !btn.disabled && isSafeToClick(btn)) {
+                    const text = ((btn.textContent || btn.value || '')).trim().toLowerCase();
+                    if (text.includes('counting') || text.includes('please wait') || text.includes('waiting')) continue;
+                    console.log('[KillURL] Clicking initial countdown trigger button matching selector:', selector);
+                    lastInitialBtnClickT = Date.now();
+                    navigateOrClick(btn);
+                    return true;
+                }
+            } catch (e) { /* skip */ }
+        }
+
+        // Fallback text matching for visible initial verification buttons
+        try {
+            const clickables = document.querySelectorAll('button, a.btn, a[role="button"], input[type="button"]');
+            for (const el of clickables) {
+                if (!isVisible(el) || el.disabled || !isSafeToClick(el)) continue;
+                const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
+                if (/^(?:click\s*(?:here\s*)?to\s*(?:verify|start)|verify\s*to\s*continue|start\s*verification)$/i.test(text)) {
+                    console.log('[KillURL] Clicking initial countdown trigger button by text match:', text);
+                    lastInitialBtnClickT = Date.now();
+                    navigateOrClick(el);
+                    return true;
+                }
+            }
+        } catch (e) { /* skip */ }
+
+        return false;
     }
 
     function clickContinueButton() {
         if (!isEnabled()) return false;
         if (isProtectedSite || isFinalSite) return false;
+        if (isCaptchaShortenerDomain()) return false;
         if (isSecurityPage && !settings.aggressiveMode) return false;
         if (isCaptchaPending()) {
             console.log('[KillURL] Captcha / Turnstile pending — waiting for completion before clicking');
-            return false;
-        }
-
-        // If countdown is actively ticking down, do not click prematurely!
-        if (countdownIsLive()) {
-            console.log('[KillURL] Countdown is actively ticking — waiting for completion before clicking');
             return false;
         }
 
@@ -3584,12 +4688,16 @@
         // earnbox.in specific handling
         if (hostname === 'earnbox.in') {
             const found = clickEarnboxButton();
-            // If earnbox handler didn't find anything, fall through to generic handler
             if (found) return true;
             console.log('[KillURL] earnbox.in: Falling back to generic handler...');
         }
 
-        // Try to click or navigate via known button selectors
+        // 0. If an initial countdown trigger button is waiting to be pressed, press it to start the timer!
+        if (clickInitialVerificationButton()) {
+            return true;
+        }
+
+        // Comprehensive button selectors for earn blogs, shorteners, and WordPress templates
         const buttonSelectors = [
             '#skip', '.skip', 'a#skip', 'a.skip',
             '#continue', '.continue', 'a#continue', 'a.continue',
@@ -3597,6 +4705,20 @@
             '#getlink', '.getlink', 'a#getlink', 'a.getlink',
             '#btn-main', '.btn-main', 'a#btn-main', 'a.btn-main',
             '#land-btn', '.land-btn',
+            '#cross-snp2', '#tp-snp2',
+            'button.button-61', '.button-61',
+            'a[href*="learn_more.php"] button', 'a[href*="learn_more.php"]',
+            '#btn6', '.btn6', 'a#btn6', 'button#btn6',
+            '#btn2', '.btn2', '#btn1', '.btn1', '#btn0', '.btn0',
+            '#gotolink', '.gotolink', 'a#gotolink', 'button#gotolink',
+            '#c-btn', '.c-btn', '#cbtn', '.cbtn', 'a#cbtn', 'button#cbtn',
+            '#makinglink', '.makinglink', 'a#makinglink',
+            '#nextbtn', '.nextbtn', 'button#nextbtn', 'a#nextbtn',
+            '#submit-btn', '.submit-btn', 'button#submit-btn',
+            '#show-link', '.show-link', 'a#show-link',
+            '#f-btn', '.f-btn', 'button#f-btn',
+            '#generate', '.generate', 'button#generate', 'a#generate',
+            '#verify-btn', '.verify-btn', 'button#verify-btn', 'a#verify-btn',
             '#wpsafe-link a', '#wpsafe-link button', '#wpsafe-link',
             '.wpsafe-link a', '.wpsafe-link button', '.wpsafe-link',
             '#wpsafe-generate a', '#wpsafe-generate button', '#wpsafe-generate',
@@ -3606,32 +4728,47 @@
             '#skip-btn', '.skip-btn',
             '#link-btn', '.link-btn', '#get-link', '.get-link',
             '#verify', '.verify', 'form#go-link button', 'form.go-link button',
+            'a.btn-primary', 'button.btn-primary', 'a.btn-success', 'button.btn-success',
+            'a.btn-info', 'button.btn-info',
+            '[id*="continue"]', '[id*="getlink"]', '[id*="get-link"]', '[id*="gotolink"]',
         ];
 
+        // 1. Check visible matching buttons
         for (const selector of buttonSelectors) {
             try {
                 const btn = document.querySelector(selector);
                 if (btn && isVisible(btn) && !btn.disabled && isSafeToClick(btn)) {
+                    // If countdown is actively ticking down with positive numbers, hold
+                    const v = readCountdownValue();
+                    if (v != null && v > 0) {
+                        console.log('[KillURL] Visible button found (' + selector + '), but countdown is ticking (' + v + 's remaining)');
+                        return false;
+                    }
+                    console.log('[KillURL] Clicking visible button matching selector:', selector);
                     navigateOrClick(btn);
                     return true;
                 }
             } catch (e) { /* skip */ }
         }
 
-        // Fallback: smart text-based click (covers unknown templates/wordings).
-        // Loose matching is fine here — the page already qualified (or the user
-        // explicitly armed it via Skip).
+        // 2. Fallback: smart text-based click on visible elements
         const clickables = document.querySelectorAll('a, button, input[type="submit"], input[type="button"], [role="button"]');
         for (const el of clickables) {
             if (!isVisible(el) || el.disabled) continue;
             if (!isSafeToClick(el)) continue;
             const text = ((el.textContent || el.value || '') + ' ' + (el.getAttribute('aria-label') || '')).trim();
             if (matchesCTA(text, true)) {
-                console.log('[KillURL] Clicking Continue:', text.slice(0, 60));
+                const v = readCountdownValue();
+                if (v != null && v > 0) {
+                    console.log('[KillURL] CTA text matched (' + text.slice(0, 30) + '), but countdown is ticking (' + v + 's)');
+                    return false;
+                }
+                console.log('[KillURL] Clicking Continue by text match:', text.slice(0, 60));
                 navigateOrClick(el);
                 return true;
             }
         }
+
         return false;
     }
 
@@ -3642,6 +4779,8 @@
     function clickEarnboxButton() {
         if (!isEnabled()) return false;
         if (!autoPressAllowed()) return false;
+        const v = readCountdownValue();
+        if ((v != null && v > 0) || countdownIsLive()) return false;
         console.log('[KillURL] earnbox.in: Looking for buttons (Get Link or Continue)...');
         
         // Strategy 1: Look for buttons/links with specific text patterns (check hidden ones too)
@@ -3765,9 +4904,15 @@
         return false;
     }
 
-    function navigateOrClick(el) {
+    async function navigateOrClick(el) {
         if (!isSafeToClick(el)) return;
         try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* ignore */ }
+
+        // On multi-step blog chains, delegate to dedicated Paced Step Advance
+        if (isPacedDomain() || el.id === 'tp-snp2' || el.id === 'cross-snp2') {
+            executePacedStepAdvance();
+            return;
+        }
 
         // Get href from element or its parent link
         let href = el.getAttribute('href');
@@ -3805,10 +4950,15 @@
         // Always click the element first so page event handlers,
         // AJAX token fetches, form submissions, and analytics/session updates run naturally!
         console.log('[KillURL] Clicking CTA element:', (el.textContent || el.value || el.id || el.className || 'button').trim().slice(0, 60));
-        suppressAutoPressUntil = Date.now() + 15000;
+        suppressAutoPressUntil = Date.now() + 2500;
         const navFrom = window.location.href;
 
         // Dispatch full human click sequence FIRST (unloading must not be true during the click!)
+        const parentLink = el.closest('a[href]');
+        if (parentLink) {
+            try { parentLink.click(); } catch (e) { /* ignore */ }
+            dispatchFullClickSequence(parentLink);
+        }
         const clicked = dispatchFullClickSequence(el);
         if (clicked) {
             unloading = true;
@@ -3816,7 +4966,7 @@
                 try {
                     if (window.location.href === navFrom) unloading = false;
                 } catch (e) { unloading = false; }
-            }, 8000);
+            }, 2500);
         }
 
         // If clicking did not trigger navigation after a settle window,
@@ -3882,6 +5032,8 @@
             const full = u.pathname + u.search + u.hash;
             if (host === 'mediafire.com' || host.endsWith('.mediafire.com')) {
                 if (/(?:error\.php|\berrno=\d+|\borigin=download|upgrade_support\.php|terms_of_service)/i.test(full)) return true;
+                // Honeypot / poisoned decoy links generated by shorteners have fake random suffixes (e.g. /rnji, /hlos) instead of /file
+                if (/\/(?:file|download)\/[a-zA-Z0-9_-]+\/[^\/]+\/(?!file$|download$)[a-zA-Z0-9]{3,6}(?:\/|\?|#|$)/i.test(full)) return true;
                 return !(/\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]{4,}|\/\?[a-zA-Z0-9_-]{5,}/i.test(full));
             }
             if (host === 'mega.nz' || host === 'mega.io') {
@@ -3900,7 +5052,14 @@
         if (!url) return false;
         url = url.trim();
         if (isErrorDestination(url)) return false;
+        if (url.includes('learn_more.php') || url.includes('/studyeducates/') || url.includes('/educatestudies/')) return true;
         if (url.startsWith('/go/') || url.startsWith('/out/') || url.startsWith('/redirect/') || url.startsWith('/link/')) return true;
+        if (isPacedDomain()) {
+            try {
+                const u = new URL(url, window.location.href);
+                if (isPacedDomain(u.hostname)) return true;
+            } catch (e) { /* ignore */ }
+        }
         if (!url.startsWith('http://') && !url.startsWith('https://')) return false;
         if (isAdHost(url)) return false;
         try {
@@ -3914,6 +5073,62 @@
         } catch (e) {
             return false;
         }
+    }
+
+    // ===== PREMATURE CLICK GUARD =====
+    // Intercept and block user clicks on Continue / Next buttons while a countdown
+    // is ticking down. Clicking these before the server-side timer elapses invalidates
+    // the security token in the shortener's database, producing dead download links.
+    let clickGuardInstalled = false;
+    function setupPrematureClickGuard() {
+        if (clickGuardInstalled) return;
+        clickGuardInstalled = true;
+        document.addEventListener('click', (e) => {
+            if (!isEnabled()) return;
+            if (isSecurityPage && !settings.aggressiveMode) return;
+            // On paced domains, let PacedStepController manage pacing — never block user clicks and NEVER tamper with session cookies!
+            if (isPacedDomain()) {
+                return;
+            }
+            const rem = readCountdownValue();
+            const live = countdownIsLive();
+            if ((rem != null && rem > 0) || live) {
+                const btn = e.target?.closest?.('a, button, input[type="submit"], input[type="button"], [role="button"]');
+                if (btn) {
+                    const text = (((btn.textContent || btn.value || '') + ' ' + (btn.id || '')).trim()).toLowerCase();
+                    // Allow ALL initial countdown trigger / verification buttons (never block clicks to start or verify!)
+                    if (btn.id === 'startCountdownBtn' ||
+                        btn.id === 'cross-snp' ||
+                        btn.id === 'tp-snp' ||
+                        btn.className?.toLowerCase?.().includes('start-countdown') ||
+                        text.includes('verify') ||
+                        text.includes('start') ||
+                        text.includes('robot') ||
+                        text.includes('human')) {
+                        return;
+                    }
+
+                    // If button is cross-snp2, tp-snp2, btn7, btn6, btn1 and is VISIBLE, never block it!
+                    const advanceBtn = (btn.id === 'cross-snp2' || btn.id === 'tp-snp2' || btn.id === 'btn7' || btn.id === 'btn6' || btn.id === 'btn1') ? btn : btn.querySelector?.('#cross-snp2, #tp-snp2, #btn7, #btn6, #btn1');
+                    if (advanceBtn && isVisible(advanceBtn) && !advanceBtn.disabled) {
+                        return;
+                    }
+
+                    // ONLY block terminal advance buttons (cross-snp2 and tp-snp2 that navigate to learn_more.php)
+                    const isTerminalAdvance = btn.id === 'cross-snp2' ||
+                        btn.id === 'tp-snp2' ||
+                        !!btn.closest('a[href*="learn_more.php"]');
+                    if (isTerminalAdvance) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        const waitSec = (rem != null && rem > 0) ? `~${rem}s` : 'a few seconds';
+                        console.log(`[KillURL] Premature click blocked (${waitSec} remaining on timer) to preserve valid download link.`);
+                        updatePageHint(`⏳ Waiting for timer (${waitSec} remaining) — clicking early kills the download link!`);
+                    }
+                }
+            }
+        }, true);
     }
 
     // ===== MUTATION OBSERVER (passive — detection only) =====
@@ -3944,11 +5159,11 @@
                             }
 
                             // If turnstile or captcha was injected after load, notify injector to stand down
-                            const html = node.innerHTML || '';
-                            const src = (node.src || node.getAttribute?.('src') || '').toLowerCase();
-                            if (html.includes('challenges.cloudflare.com') || html.includes('turnstile') || src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
+                            const nodeHtml = (node.innerHTML || node.outerHTML || '').toLowerCase();
+                            const nodeSrc = (node.getAttribute?.('src') || '').toLowerCase();
+                            if (nodeHtml.includes('challenges.cloudflare.com/turnstile') || nodeHtml.includes('cf-turnstile') || nodeSrc.includes('challenges.cloudflare.com')) {
                                 try {
-                                    window.dispatchEvent(new CustomEvent('killurl-security-page', { detail: { reason: 'mutation-turnstile' } }));
+                                    window.dispatchEvent(new CustomEvent('killurl-turnstile-detected', { detail: { reason: 'mutation-turnstile' } }));
                                 } catch (e) { /* ignore */ }
                             }
 
@@ -3995,6 +5210,7 @@
 
     function removeAdBlockWalls() {
         if (!isEnabled()) return 0;
+        if (isCaptchaShortenerDomain() || isCaptchaPending() || isSecurityPage) return 0;
         let removed = 0;
 
         // Text patterns that identify ad-block detection overlays
