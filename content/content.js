@@ -4460,12 +4460,14 @@
             const elapsedMs = Date.now() - startTime;
             const elapsedSec = elapsedMs / 1000;
 
-            // Sync with page timer if higher
-            const pageRem = readCountdownValue();
-            if (pageRem != null && pageRem > 0) {
-                const requiredTotal = Math.max(PACED_STEP_FLOOR_SEC, Math.ceil(elapsedSec + pageRem));
-                if (requiredTotal > totalSec) {
-                    totalSec = requiredTotal;
+            // During initial 2 seconds only, adapt totalSec if page shows a legitimate higher countdown
+            if (elapsedSec < 2.0) {
+                const pageRem = readCountdownValue();
+                if (pageRem != null && pageRem > 0 && pageRem <= 30) {
+                    const requiredTotal = Math.max(PACED_STEP_FLOOR_SEC, Math.ceil(pageRem));
+                    if (requiredTotal > totalSec) {
+                        totalSec = requiredTotal;
+                    }
                 }
             }
 
@@ -4474,8 +4476,8 @@
 
             const btnReady = !!findPacedAdvanceButton(stepNum);
 
-            // Complete strictly after the full 15s+ pacing duration has elapsed AND page countdown has reached 0
-            if (elapsedSec >= totalSec && (pageRem == null || pageRem <= 0)) {
+            // Complete strictly after the pacing duration has elapsed (never stuck on moving goalpost!)
+            if (elapsedSec >= totalSec) {
                 clearInterval(pacedInterval);
                 const doneMsg = (stepNum === 3)
                     ? 'MediaFire clearance secured! Unlocking destination...'
