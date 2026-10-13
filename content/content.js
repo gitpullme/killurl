@@ -2546,9 +2546,9 @@
                 }
             }
 
-            // On paced shortener domains or if CTA exists, do NOT fall back to searching bodyText,
+            // On paced shortener domains, captcha shorteners, or if CTA exists, do NOT fall back to searching bodyText,
             // which matches static marketing/instructional headings like "WAIT 10 SECONDS TO GET LINK"!
-            if (isPacedDomain() || hasPressableCTA()) return null;
+            if (isPacedDomain() || isCaptchaShortenerDomain() || hasPressableCTA()) return null;
 
             const bodyText = document.body?.innerText || '';
             const pats = [
@@ -4384,8 +4384,10 @@
 
         const cleanHost = host.replace(/^www\./, '');
         const stepBadge = `${stepLabel} (${cleanHost})`;
-        const targetDuration = 10; // Standard 10-second pacing average
-        const totalSec = targetDuration;
+        const PACED_STEP_FLOOR_SEC = 15; // Minimum 15-second pacing floor required by backend server
+        const detectedWait = readCountdownValue();
+        let targetDuration = Math.max(PACED_STEP_FLOOR_SEC, (detectedWait != null && detectedWait > 0) ? detectedWait : PACED_STEP_FLOOR_SEC);
+        let totalSec = targetDuration;
         const startTime = Date.now();
 
         const initialMsg = (stepNum === 3)
@@ -4414,6 +4416,12 @@
                 return;
             }
 
+            // Sync with page timer if higher
+            const pageRem = readCountdownValue();
+            if (pageRem != null && pageRem > 0 && pageRem > totalSec) {
+                totalSec = pageRem;
+            }
+
             const elapsedMs = Date.now() - startTime;
             const elapsedSec = elapsedMs / 1000;
             const remainingSec = Math.max(0, Math.ceil(totalSec - elapsedSec));
@@ -4421,7 +4429,7 @@
 
             const btnReady = !!findPacedAdvanceButton(stepNum);
 
-            // Complete strictly after the full 10s pacing duration has elapsed (never early advance!)
+            // Complete strictly after the full 15s+ pacing duration has elapsed (never early advance!)
             if (elapsedSec >= totalSec) {
                 clearInterval(pacedInterval);
                 const doneMsg = (stepNum === 3)
@@ -4450,13 +4458,13 @@
             // Dynamic behind-the-scenes telemetry message based on elapsed progress
             let stepMsg = initialMsg;
             let stepTelem = initialTelem;
-            if (elapsedSec < 3.5) {
+            if (elapsedSec < (totalSec * 0.35)) {
                 stepTelem = '🛡️ Stealth Pacing Active • 🍪 Session Synced • 🚫 Ad Walls Neutralized';
-            } else if (elapsedSec < 7.5) {
+            } else if (elapsedSec < (totalSec * 0.75)) {
                 stepMsg = (stepNum === 3)
                     ? 'Validating token authorization with MediaFire gateway...'
                     : (stepNum === 2 ? 'Verifying Transit Step 2 with server...' : 'Simulating natural interaction & pacing...');
-                stepTelem = '⏳ 10s Server Lock • 🤖 Human Behavior Emulated';
+                stepTelem = `⏳ ${totalSec}s Server Lock • 🤖 Human Behavior Emulated`;
             } else {
                 stepMsg = (stepNum === 3)
                     ? 'Final clearance ready soon • Arming destination unlock...'
@@ -4577,7 +4585,7 @@
     let vplinkFinalStarted = false;
     // No more MAIN world event listener for killurl-aro-setup — page runs natively.
     // We use a fixed 10s assumption (AroShield default) since we can't intercept the setup call.
-    const VPLINK_WAIT_SEC = 10;
+    const VPLINK_WAIT_SEC = 15; // 15-second server-verified pacing floor
 
     function startVplinkFinalController() {
         if (!isEnabled()) return;
@@ -4673,13 +4681,16 @@
             // Turnstile is verified! Record the solve time on first occurrence
             if (!turnstileSolvedT) {
                 turnstileSolvedT = Date.now();
-                console.log('[KillURL] Turnstile verified on vplink! AroShield 10s server pacing lock started.');
+                console.log('[KillURL] Turnstile verified on vplink! AroShield 15s server pacing lock started.');
             }
+
+            const domWait = readCountdownValue();
+            const vplinkTotal = Math.max(VPLINK_WAIT_SEC, (domWait != null && domWait > 0) ? domWait : VPLINK_WAIT_SEC);
 
             const elapsedMs = Date.now() - turnstileSolvedT;
             const elapsedSec = elapsedMs / 1000;
-            const remainingSec = Math.max(0, Math.ceil(VPLINK_WAIT_SEC - elapsedSec));
-            const progressPct = Math.min(100, Math.max(0, (elapsedSec / VPLINK_WAIT_SEC) * 100));
+            const remainingSec = Math.max(0, Math.ceil(vplinkTotal - elapsedSec));
+            const progressPct = Math.min(100, Math.max(0, (elapsedSec / vplinkTotal) * 100));
 
             if (remainingSec > 0) {
                 renderSmartBar({
@@ -4687,15 +4698,15 @@
                     message: 'Turnstile verified! AroShield server timer counting down...',
                     telemetry: `✅ Turnstile Solved • ⏳ Server Pacing (${remainingSec}s remaining)`,
                     remaining: remainingSec,
-                    total: VPLINK_WAIT_SEC,
+                    total: vplinkTotal,
                     progressPct: progressPct,
                     icon: '⏳',
                     isReady: false
                 });
-                return; // Strictly hold: never scan or click while 10s pacing timer is running!
+                return; // Strictly hold: never scan or click while 15s pacing timer is running!
             }
 
-            // Turnstile verified AND full 10 seconds elapsed!
+            // Turnstile verified AND full pacing duration elapsed!
             // First, scan DOM for destination link
             const foundHref = scanForDestinationLink();
             if (foundHref && isValidDestination(foundHref) && !isErrorDestination(foundHref)) {
@@ -4710,7 +4721,7 @@
                 message: 'Pacing complete! Intercepting authentic MediaFire link...',
                 telemetry: '🔍 Deep Network & DOM Scanner Intercepting Link',
                 remaining: 0,
-                total: VPLINK_WAIT_SEC,
+                total: vplinkTotal,
                 progressPct: 100,
                 icon: '🚀',
                 isReady: true
