@@ -351,21 +351,9 @@
     let lastCaptchaPending = false;
     let captchaGateOpened = false;
     function checkCaptchaResolution() {
-        // If on captcha shortener and a valid destination is candidate, process it!
         if (isCaptchaShortenerDomain()) {
-            findDestinationUrl();
-            if (destinationUrl && !isErrorDestination(destinationUrl)) {
-                processCandidateDestination(destinationUrl);
-                return;
-            }
-            const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #get-link, .get-link, a#get-link, a.get-link, #btn-main, a.btn-main');
-            if (btn) {
-                const href = (btn.getAttribute('href') || btn.href || '').trim();
-                if (href && isValidDestination(href) && !isErrorDestination(href)) {
-                    processCandidateDestination(href);
-                    return;
-                }
-            }
+            // Dedicated startVplinkFinalController manages Turnstile, server pacing, and destination capture
+            return;
         }
 
         const pending = isCaptchaPending();
@@ -374,38 +362,6 @@
             captchaGateOpened = true;
             console.log('[KillURL] Captcha / Turnstile verified successfully! Gate opened.');
             isSecurityPage = false;
-
-            if (isCaptchaShortenerDomain()) {
-                // On captcha shortener domains (e.g. vplink.in), the site's own script sends
-                // the Turnstile token to the server via AJAX. We MUST NOT double-submit the form
-                // or press buttons prematurely, as duplicate token submission causes "Verification failed"!
-                // Instead, watch for the page's AJAX to populate the Get Link button with the authentic final URL.
-                let pollAttempts = 0;
-                const pollInterval = setInterval(() => {
-                    pollAttempts++;
-                    findDestinationUrl();
-                    if (destinationUrl && !isErrorDestination(destinationUrl)) {
-                        clearInterval(pollInterval);
-                        console.log('[KillURL] Captcha shortener destination found:', destinationUrl);
-                        processCandidateDestination(destinationUrl);
-                        return;
-                    }
-                    const btn = document.querySelector('#getlink, .getlink, a#getlink, a.getlink, #get-link, .get-link, a#get-link, a.get-link, #btn-main, a.btn-main');
-                    if (btn) {
-                        const href = (btn.getAttribute('href') || btn.href || '').trim();
-                        if (href && isValidDestination(href) && !isErrorDestination(href)) {
-                            clearInterval(pollInterval);
-                            console.log('[KillURL] Captcha shortener destination ready on CTA:', href);
-                            processCandidateDestination(href);
-                            return;
-                        }
-                    }
-                    if (pollAttempts >= 60) {
-                        clearInterval(pollInterval);
-                    }
-                }, 500);
-                return;
-            }
 
             setTimeout(() => {
                 if (!isEnabled()) return;
@@ -1421,6 +1377,10 @@
             console.log('[KillURL] Captcha shortener domain — auto-skip standing by for captcha completion');
             return;
         }
+        if (isPacedDomain()) {
+            console.log('[KillURL] Paced domain — auto-skip strictly delegated to PacedStepController');
+            return;
+        }
         if (skipAttempted) return;
         if (!settings.autoSkip) return;
         // NOTE: no late-patient heuristic here. Patient engagement comes only
@@ -1764,7 +1724,7 @@
 
     function executeGentleSkip() {
         if (!isEnabled()) return;
-        if (isProtectedSite || isFinalSite) return;
+        if (isProtectedSite || isFinalSite || isPacedDomain() || isCaptchaShortenerDomain()) return;
         if (isSecurityPage && !settings.aggressiveMode) return;
         if (isCaptchaPending()) return;
 
@@ -1786,6 +1746,7 @@
         // Try clicking continue buttons only if countdown is not actively ticking
         setTimeout(() => {
             if (!isEnabled()) return;
+            if (isPacedDomain() || isCaptchaShortenerDomain()) return;
             if (countdownIsLive() || isCaptchaPending()) return;
             clickContinueButton();
             submitTokenFormIfReady();
@@ -1801,8 +1762,8 @@
             console.log('[KillURL] Skip blocked — extension is turned OFF');
             return;
         }
-        if (isProtectedSite) {
-            console.log('[KillURL] Skip blocked — protected site');
+        if (isProtectedSite || isPacedDomain() || isCaptchaShortenerDomain()) {
+            console.log('[KillURL] Skip blocked — protected or paced site');
             return;
         }
         if (isFinalSite) {
@@ -2573,13 +2534,6 @@
     // timer-shaped is on screen. ("Step 1 of 6" parses to null on purpose.)
     function readCountdownValue() {
         try {
-            // If on a paced shortener domain and a terminal advance button (#cross-snp2 or #tp-snp2)
-            // is already visible, the page's countdown timer has ALREADY completed! Return 0.
-            const crossBtn = document.getElementById('cross-snp2');
-            if (crossBtn && isVisible(crossBtn)) return 0;
-            const tpBtn = document.getElementById('tp-snp2');
-            if (tpBtn && isVisible(tpBtn)) return 0;
-
             for (const selector of COUNTDOWN_SELECTORS) {
                 let el = null;
                 try { el = document.querySelector(selector); } catch (e) { continue; }
@@ -2594,7 +2548,7 @@
 
             // On paced shortener domains or if CTA exists, do NOT fall back to searching bodyText,
             // which matches static marketing/instructional headings like "WAIT 10 SECONDS TO GET LINK"!
-            if (isPacedDomain() || hasPressableCTA()) return 0;
+            if (isPacedDomain() || hasPressableCTA()) return null;
 
             const bodyText = document.body?.innerText || '';
             const pats = [
@@ -2929,6 +2883,9 @@
     }
 
     function findDestinationUrl() {
+        // On captcha shortener domains (vplink.in) and paced blog chains, destination harvesting
+        // is strictly managed by startVplinkFinalController and startPacedStepController
+        if (isCaptchaShortenerDomain() || isPacedDomain()) return;
         // If countdown is actively ticking, do not harvest premature destination links
         if (countdownIsLive()) return;
 
@@ -4464,8 +4421,8 @@
 
             const btnReady = !!findPacedAdvanceButton(stepNum);
 
-            // Complete if 10s elapsed or button is ready after minimum 8s view
-            if (elapsedSec >= totalSec || (btnReady && elapsedSec >= 8)) {
+            // Complete strictly after the full 10s pacing duration has elapsed (never early advance!)
+            if (elapsedSec >= totalSec) {
                 clearInterval(pacedInterval);
                 const doneMsg = (stepNum === 3)
                     ? 'MediaFire clearance secured! Unlocking destination...'
@@ -4627,12 +4584,13 @@
         if (vplinkFinalStarted) return;
         vplinkFinalStarted = true;
 
-        const vplinkStartT = Date.now();
+        let turnstileSolvedT = null;
+        let pollCount = 0;
         console.log('[KillURL] Vplink Final Controller (zero-fingerprint mode) on:', window.location.href);
 
         renderSmartBar({
             step: 'CAPTCHA GATEWAY (vplink.in)',
-            message: 'Waiting for Cloudflare Turnstile & server timer...',
+            message: 'Waiting for Cloudflare Turnstile verification...',
             telemetry: '🛡️ Zero-Fingerprint Active • 🤖 Captcha Solver Running',
             remaining: VPLINK_WAIT_SEC,
             total: VPLINK_WAIT_SEC,
@@ -4657,7 +4615,9 @@
                         const href = (el.getAttribute('href') || '').trim();
                         if (href && !href.includes('javascript:') && !href.startsWith('#') &&
                             !href.includes(window.location.hostname) &&
-                            /^https?:\/\//i.test(href)) {
+                            /^https?:\/\//i.test(href) &&
+                            isValidDestination(href) &&
+                            !isErrorDestination(href)) {
                             return href;
                         }
                     }
@@ -4670,7 +4630,7 @@
                     const href = (a.getAttribute('href') || '').trim();
                     if (!href || href.startsWith('#') || href.startsWith('javascript:')) continue;
                     if (href.includes(window.location.hostname)) continue;
-                    if (/^https?:\/\//i.test(href) && isValidDestination(href)) {
+                    if (/^https?:\/\//i.test(href) && isValidDestination(href) && !isErrorDestination(href)) {
                         return href;
                     }
                 }
@@ -4686,7 +4646,6 @@
             });
         } catch (e) { /* ignore */ }
 
-        let pollCount = 0;
         const vplinkPoll = setInterval(() => {
             if (!isEnabled() || unloading) {
                 clearInterval(vplinkPoll);
@@ -4694,21 +4653,7 @@
             }
             pollCount++;
 
-            const elapsedMs = Date.now() - vplinkStartT;
-            const elapsedSec = elapsedMs / 1000;
-            const remainingSec = Math.max(0, Math.ceil(VPLINK_WAIT_SEC - elapsedSec));
-            const progressPct = Math.min(100, Math.max(0, (elapsedSec / VPLINK_WAIT_SEC) * 100));
-
-            // 1. Scan DOM for destination link
-            const foundHref = scanForDestinationLink();
-            if (foundHref && !isErrorDestination(foundHref)) {
-                clearInterval(vplinkPoll);
-                console.log('[KillURL] Authentic destination found on vplink (DOM scan):', foundHref);
-                processCandidateDestination(foundHref);
-                return;
-            }
-
-            // 2. Check for Turnstile solved token (readable from isolated world)
+            // 1. Check if Cloudflare Turnstile has solved
             const hasTurnstile = hasSolvedCaptchaToken();
 
             if (!hasTurnstile) {
@@ -4716,66 +4661,94 @@
                     step: 'CAPTCHA GATEWAY (vplink.in)',
                     message: 'Verifying Cloudflare Turnstile...',
                     telemetry: '🤖 Turnstile Solver • 🛡️ Zero-Fingerprint Mode Active',
-                    remaining: remainingSec,
+                    remaining: VPLINK_WAIT_SEC,
                     total: VPLINK_WAIT_SEC,
-                    progressPct: Math.min(85, progressPct),
+                    progressPct: 15,
                     icon: '🛡️',
                     isReady: false
                 });
-            } else if (remainingSec > 0) {
+                return; // Strictly hold: never scan or click while Turnstile is pending!
+            }
+
+            // Turnstile is verified! Record the solve time on first occurrence
+            if (!turnstileSolvedT) {
+                turnstileSolvedT = Date.now();
+                console.log('[KillURL] Turnstile verified on vplink! AroShield 10s server pacing lock started.');
+            }
+
+            const elapsedMs = Date.now() - turnstileSolvedT;
+            const elapsedSec = elapsedMs / 1000;
+            const remainingSec = Math.max(0, Math.ceil(VPLINK_WAIT_SEC - elapsedSec));
+            const progressPct = Math.min(100, Math.max(0, (elapsedSec / VPLINK_WAIT_SEC) * 100));
+
+            if (remainingSec > 0) {
                 renderSmartBar({
                     step: 'MEDIAFIRE ACCESS',
                     message: 'Turnstile verified! AroShield server timer counting down...',
-                    telemetry: '✅ Turnstile Solved • ⏳ Server Pacing (10s Lock)',
+                    telemetry: `✅ Turnstile Solved • ⏳ Server Pacing (${remainingSec}s remaining)`,
                     remaining: remainingSec,
                     total: VPLINK_WAIT_SEC,
                     progressPct: progressPct,
                     icon: '⏳',
                     isReady: false
                 });
-            } else {
-                // Timer elapsed + Turnstile verified
-                renderSmartBar({
-                    step: 'MEDIAFIRE ACCESS',
-                    message: 'Pacing complete! Intercepting authentic MediaFire link...',
-                    telemetry: '🔍 Deep Network & DOM Scanner Intercepting Link',
-                    remaining: 0,
-                    total: VPLINK_WAIT_SEC,
-                    progressPct: 100,
-                    icon: '🚀',
-                    isReady: true
-                });
+                return; // Strictly hold: never scan or click while 10s pacing timer is running!
+            }
 
-                // Check if Get Link button has become clickable and trigger it naturally
-                const ctaBtn = document.getElementById('get-link') ||
-                               document.querySelector('a.get-link, a#getlink, #btn-main, a.btn-main, button#get-link');
-                if (ctaBtn && !ctaBtn.hasAttribute('disabled') && !ctaBtn.classList.contains('disabled')) {
-                    const ctaHref = (ctaBtn.getAttribute('href') || ctaBtn.href || '').trim();
-                    if (ctaHref && isValidDestination(ctaHref) && !isErrorDestination(ctaHref)) {
-                        clearInterval(vplinkPoll);
-                        console.log('[KillURL] Authentic destination ready on CTA:', ctaHref);
-                        processCandidateDestination(ctaHref);
-                        return;
-                    }
-                    try {
-                        dispatchFullClickSequence(ctaBtn);
-                    } catch (e) {
-                        try { ctaBtn.click(); } catch (e2) {}
-                    }
+            // Turnstile verified AND full 10 seconds elapsed!
+            // First, scan DOM for destination link
+            const foundHref = scanForDestinationLink();
+            if (foundHref && isValidDestination(foundHref) && !isErrorDestination(foundHref)) {
+                clearInterval(vplinkPoll);
+                console.log('[KillURL] Authentic destination found on vplink (DOM scan):', foundHref);
+                processCandidateDestination(foundHref);
+                return;
+            }
+
+            renderSmartBar({
+                step: 'MEDIAFIRE ACCESS',
+                message: 'Pacing complete! Intercepting authentic MediaFire link...',
+                telemetry: '🔍 Deep Network & DOM Scanner Intercepting Link',
+                remaining: 0,
+                total: VPLINK_WAIT_SEC,
+                progressPct: 100,
+                icon: '🚀',
+                isReady: true
+            });
+
+            // Check if Get Link button has become clickable and trigger it naturally
+            const ctaBtn = document.getElementById('get-link') ||
+                           document.querySelector('a.get-link, a#getlink, #btn-main, a.btn-main, button#get-link');
+            if (ctaBtn && !ctaBtn.hasAttribute('disabled') && !ctaBtn.classList.contains('disabled')) {
+                const ctaHref = (ctaBtn.getAttribute('href') || ctaBtn.href || '').trim();
+                if (ctaHref && isValidDestination(ctaHref) && !isErrorDestination(ctaHref)) {
+                    clearInterval(vplinkPoll);
+                    console.log('[KillURL] Authentic destination ready on CTA:', ctaHref);
+                    processCandidateDestination(ctaHref);
+                    return;
+                }
+                try {
+                    dispatchFullClickSequence(ctaBtn);
+                } catch (e) {
+                    try { ctaBtn.click(); } catch (e2) {}
                 }
             }
 
-            // After 60 seconds (600 iterations at 100ms), stop polling
+            // After 60 seconds of post-turnstile polling (600 iterations at 100ms), stop polling
             if (pollCount >= 600) {
                 clearInterval(vplinkPoll);
             }
         }, 100);
 
-        // Additionally, set up a MutationObserver to catch the destination link the moment it appears
+        // Additionally, set up a MutationObserver to catch the destination link the moment it appears AFTER pacing
         try {
             const observer = new MutationObserver((mutations) => {
+                if (!hasSolvedCaptchaToken()) return;
+                if (!turnstileSolvedT) return;
+                if ((Date.now() - turnstileSolvedT) / 1000 < VPLINK_WAIT_SEC) return;
+
                 const href = scanForDestinationLink();
-                if (href && !isErrorDestination(href)) {
+                if (href && isValidDestination(href) && !isErrorDestination(href)) {
                     observer.disconnect();
                     clearInterval(vplinkPoll);
                     console.log('[KillURL] Authentic destination found on vplink (MutationObserver):', href);
@@ -4844,6 +4817,7 @@
         if (!isEnabled()) return false;
         if (isProtectedSite || isFinalSite) return false;
         if (isCaptchaShortenerDomain()) return false;
+        if (isPacedDomain()) return false; // Managed strictly by PacedStepController
         if (isSecurityPage && !settings.aggressiveMode) return false;
         if (isCaptchaPending()) {
             console.log('[KillURL] Captcha / Turnstile pending — waiting for completion before clicking');
@@ -5076,9 +5050,8 @@
         if (!isSafeToClick(el)) return;
         try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* ignore */ }
 
-        // On multi-step blog chains, delegate to dedicated Paced Step Advance
-        if (isPacedDomain() || el.id === 'tp-snp2' || el.id === 'cross-snp2') {
-            executePacedStepAdvance();
+        // On multi-step blog chains, pacing is strictly managed by startPacedStepController
+        if (isPacedDomain() || isCaptchaShortenerDomain() || el.id === 'tp-snp2' || el.id === 'cross-snp2') {
             return;
         }
 
@@ -5201,7 +5174,7 @@
             if (host === 'mediafire.com' || host.endsWith('.mediafire.com')) {
                 if (/(?:error\.php|\berrno=\d+|\borigin=download|upgrade_support\.php|terms_of_service)/i.test(full)) return true;
                 // Honeypot / poisoned decoy links generated by shorteners have fake random suffixes (e.g. /rnji, /hlos) instead of /file
-                if (/\/(?:file|download)\/[a-zA-Z0-9_-]+\/[^\/]+\/(?!file$|download$)[a-zA-Z0-9]{3,6}(?:\/|\?|#|$)/i.test(full)) return true;
+                if (/\/(?:file|download)\/[a-zA-Z0-9_-]+\/[^\/]+\/(?!file(?:[\/?#]|$))[^\/?#]+/i.test(full)) return true;
                 return !(/\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]{4,}|\/\?[a-zA-Z0-9_-]{5,}/i.test(full));
             }
             if (host === 'mega.nz' || host === 'mega.io') {
