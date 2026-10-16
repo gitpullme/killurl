@@ -135,6 +135,23 @@
         't.me', 'telegram.me', 'telegram.dog',
     ];
 
+    // File-host finals: the ONLY hosts the Smart Bar may treat as an unlocked
+    // DOWNLOAD (destination bar + auto-redirect). Social/app-store finals
+    // (t.me, github.com, play.google.com, …) stay valid *arrival*
+    // destinations when actually navigated to, but must never be harvested
+    // as "the file" from promo/join links sitting on intermediate pages.
+    const FILE_HOSTS = [
+        'mediafire.com', 'mega.nz', 'mega.io',
+        'drive.google.com', 'docs.google.com', 'drive.usercontent.google.com',
+        'dropbox.com', 'dropboxusercontent.com',
+        'onedrive.live.com', '1drv.ms', 'sharepoint.com',
+        'gofile.io', 'pixeldrain.com', 'pixeldra.in',
+        'terabox.com', 'teraboxapp.com', '1024terabox.com', 'terasharelink.com',
+        'workupload.com', 'krakenfiles.com', 'sendspace.com', 'send.cm',
+        'filemail.com', 'wetransfer.com', 'we.tl',
+        'icedrive.net', 'pcloud.com', 'box.com', 'app.box.com',
+    ];
+
     // Major sites where KillURL must never act on its own (it ran on these
     // before and pressed random Download / Continue buttons).
     const PROTECTED = [
@@ -266,10 +283,19 @@
         return inList(host, FINAL);
     }
 
+    function isFileHost(h) {
+        return inList(h, FILE_HOSTS);
+    }
+
+    function isFileDestination(url) {
+        if (!url || isErrorUrl(url)) return false;
+        return isFileHost(hostOfUrl(url));
+    }
+
     root.KILLURL_SITES = Object.freeze({
-        SHORTENERS, FINAL, PROTECTED, STREAMING, PATIENT_SEED, CAPTCHA_SHORTENER,
+        SHORTENERS, FINAL, FILE_HOSTS, PROTECTED, STREAMING, PATIENT_SEED, CAPTCHA_SHORTENER,
         normHost, inList, normCustom, classify, hostOfUrl,
-        isErrorUrl, isValidFinalDestination,
+        isErrorUrl, isValidFinalDestination, isFileHost, isFileDestination,
         isShortener: (h) => inList(h, SHORTENERS),
         isFinal: (h) => inList(h, FINAL),
         isProtected: (h) => inList(h, PROTECTED),

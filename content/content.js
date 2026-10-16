@@ -2516,10 +2516,23 @@
             if (!t) return null;
             // Ignore article metadata (reading times, publish timestamps, comments, dates)
             if (/min(?:ute)?s?\s*read|read\s*time|ago|comments?|posted|published|updated/i.test(t)) return null;
+            // Dates and clock times are NEVER countdowns: a comment timestamp
+            // like "October 16, 2026 at 3:57 pm" must not parse as 3:57 → 237s
+            // (a "5:06 pm" stamp froze the bar at a stuck 306s).
+            if (/\b(19|20)\d{2}\b/.test(t)) return null; // years: publish dates
+            if (/\b(january|february|march|april|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(t)) return null; // month names ("may" excluded: ordinary word)
+            if (/\d\s*[ap]\s*\.?\s*m\s*\.?\b/i.test(t)) return null; // "3:57 pm" clock time
             let m = t.match(/^(-?\d{1,3})\s*(?:s|sec|seconds?)?$/i);
             if (m) return parseInt(m[1], 10);
-            m = t.match(/(\d{1,3}):(\d{2})/);
+            // mm:ss only when it IS the text (real timer elements hold just
+            // "05:00"). An embedded match ("posted 5:06") counts only with
+            // explicit timer wording — never inside dates or prose.
+            m = t.match(/^\s*(\d{1,3}):(\d{2})\s*$/);
             if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            if (/wait|remain|left|countdown|timer/i.test(t)) {
+                m = t.match(/(\d{1,3}):(\d{2})/);
+                if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            }
             m = t.match(/(?:continue|proceed).{0,12}in\s*(\d+)/i);
             if (m) return parseInt(m[1], 10);
             const w = t.search(/please\s*wait|wait|remaining|left|countdown/i);
@@ -2533,6 +2546,12 @@
 
     // Current countdown value in whole seconds, or null when nothing
     // timer-shaped is on screen. ("Step 1 of 6" parses to null on purpose.)
+    // Sanity ceiling for selector-read timers. Real shortener countdowns run
+    // seconds-to-a-minute; anything above is a misread (video durations like
+    // "5:06", counters, metadata) that would freeze the bar and the click
+    // guard forever. Overlong reads are skipped, not returned.
+    const MAX_PLAUSIBLE_COUNTDOWN_SEC = 180;
+
     function readCountdownValue() {
         try {
             for (const selector of COUNTDOWN_SELECTORS) {
@@ -2542,7 +2561,7 @@
                     const text = (el.textContent || '').trim();
                     if (text && text.length < 40) {
                         const v = parseCountdownSeconds(text);
-                        if (v != null) return Math.max(0, v);
+                        if (v != null && v <= MAX_PLAUSIBLE_COUNTDOWN_SEC) return Math.max(0, v);
                     }
                 }
             }
@@ -2562,7 +2581,7 @@
                 const m = bodyText.match(p);
                 if (m) {
                     const v = parseCountdownSeconds(m[0]);
-                    if (v != null) return Math.max(0, v);
+                    if (v != null && v <= MAX_PLAUSIBLE_COUNTDOWN_SEC) return Math.max(0, v);
                 }
             }
         } catch (e) { /* ignore */ }
@@ -2865,6 +2884,18 @@
             if (isFinalDest && sites && sites.isErrorUrl(candidate)) {
                 console.log('[KillURL] Rejected incomplete/invalid final destination URL:', candidate.slice(0, 100));
                 return false;
+            }
+
+            // Social/app finals (t.me, github, play store, …) are valid
+            // arrivals but never "the download": record for the popup, but
+            // never raise the DOWNLOAD READY bar for a promo/join link.
+            if (isFinalDest && !isFileDestinationUrl(candidate)) {
+                if (destinationUrl !== candidate) {
+                    console.log('[KillURL] Non-file final destination noted (no bar hijack):', candidate.slice(0, 120));
+                }
+                destinationUrl = candidate;
+                try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (e) { /* */ }
+                return true;
             }
 
             if (destinationUrl !== candidate) {
@@ -4142,6 +4173,9 @@
 
         try { chrome.runtime.sendMessage({ type: 'FOUND_DESTINATION', url: destinationUrl }); } catch (err) { /* */ }
 
+        // Explicit opt-in only: `!== false` was true while settings were still
+        // loading (undefined), auto-redirecting users who never enabled it.
+        const willAutoRedirect = settings.autoRedirect === true;
         const totalSeconds = 20;
         const startT = Date.now();
 
@@ -4157,6 +4191,7 @@
                 icon: '🎉',
                 isReady: true,
                 destinationUrl: url,
+                noAutoRedirect: !willAutoRedirect,
                 remaining: remaining,
                 total: totalSeconds,
                 progressPct: pct,
@@ -4172,7 +4207,7 @@
             if (elapsed >= totalSeconds) {
                 clearInterval(destCountdownInterval);
                 destCountdownInterval = null;
-                if (settings.autoRedirect !== false && !unloading) {
+                if (willAutoRedirect && !unloading) {
                     unloading = true;
                     window.location.href = url;
                 }
@@ -4420,11 +4455,19 @@
                 const scripts = Array.from(document.querySelectorAll('script'));
                 for (const s of scripts) {
                     const text = s.textContent || '';
-                    const m = text.match(/(?:document|window)\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
+                    const m = text.match(/(?:document|window)\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/) ||
+                              text.match(/(?:document|window)\.location\.replace\(\s*['"]([^'"]+)['"]/) ||
+                              text.match(/(?:document|window)\.open\(\s*['"]([^'"]+)['"]/);
                     if (m && m[1] && !m[1].includes(window.location.search)) {
-                        console.log('[KillURL] Gateway script found target:', m[1]);
-                        window.location.href = m[1];
-                        return true;
+                        // Live gateways escape slashes ("https:\/\/host\/path");
+                        // navigate the real URL, never the raw escaped copy —
+                        // and never to the page we're already on (self-loop).
+                        const target = m[1].replace(/\\\//g, '/').trim();
+                        if (target && target !== window.location.href) {
+                            console.log('[KillURL] Gateway script found target:', target);
+                            window.location.href = target;
+                            return true;
+                        }
                     }
                 }
                 const fallbackPost = findArticlePostLink();
@@ -4459,18 +4502,28 @@
                 const scripts = Array.from(document.querySelectorAll('script'));
                 for (const s of scripts) {
                     const text = s.textContent || '';
-                    const m = text.match(/(?:document|window)\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
+                    const m = text.match(/(?:document|window)\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/) ||
+                              text.match(/(?:document|window)\.location\.replace\(\s*['"]([^'"]+)['"]/) ||
+                              text.match(/(?:document|window)\.open\(\s*['"]([^'"]+)['"]/);
                     if (m && m[1]) {
-                        console.log('[KillURL] learn_more.php extracted script target:', m[1]);
-                        window.location.href = m[1];
-                        return true;
+                        // Unescape live-gateway output ("https:\/\/host\/…") and
+                        // never hop to the page we're already on (self-loop).
+                        const target = m[1].replace(/\\\//g, '/').trim();
+                        if (target && target !== window.location.href) {
+                            console.log('[KillURL] learn_more.php extracted script target:', target);
+                            window.location.href = target;
+                            return true;
+                        }
                     }
                 }
                 const aTarget = document.querySelector('a[href*="educationsuniversities"], a[href*="educationstudies"], a[href*="bcsakhi"], a[href*="vplink"], a[href*="mediafire"]');
-                if (aTarget && aTarget.href) {
+                if (aTarget && aTarget.href && isValidDestination(aTarget.href) && !isErrorDestination(aTarget.href)) {
                     console.log('[KillURL] learn_more.php anchor target:', aTarget.href);
                     window.location.href = aTarget.href;
                     return true;
+                }
+                if (aTarget && aTarget.href) {
+                    console.log('[KillURL] learn_more.php anchor rejected (error/honeypot href):', String(aTarget.href).slice(0, 100));
                 }
                 return false;
             };
@@ -4612,20 +4665,43 @@
         setTimeout(triggerPacedInitialAction, 400);
         setTimeout(triggerPacedInitialAction, 1200);
 
+        // Anchors carrying honeypot/error hrefs (e.g. poisoned MediaFire
+        // /<key>/<name>/<junk> decoys) must never be picked as the advance
+        // CTA — clicking one lands the chain on a dead "key invalid" page.
+        // Elements without hrefs (buttons) are unaffected.
+        function advanceHrefOk(el) {
+            try {
+                const h = (el?.getAttribute?.('href') || '').trim();
+                if (!h || h === '#' || h.startsWith('javascript:')) return true;
+                return isValidDestination(h) && !isErrorDestination(h);
+            } catch (e) { return false; }
+        }
+
+        function firstValidHrefOk(selector) {
+            try {
+                const list = document.querySelectorAll(selector);
+                for (const el of list) {
+                    if (advanceHrefOk(el)) return el;
+                }
+            } catch (e) { /* ignore */ }
+            return null;
+        }
+
         function findPacedAdvanceCTA(sNum) {
             if (sNum === 1) {
                 const s1 = document.getElementById('cross-snp2') ||
-                           document.querySelector('button#cross-snp2, a[href*="learn_more.php"] button, a[href*="learn_more.php"]');
+                           firstValidHrefOk('button#cross-snp2, a[href*="learn_more.php"] button, a[href*="learn_more.php"]');
                 if (s1) return s1;
             } else if (sNum === 2) {
                 const s2 = document.getElementById('btn7') ||
                            document.getElementById('btn1') ||
-                           document.querySelector('button#btn7, a#btn1, button#btn1, a[href*="learn_more.php"]');
+                           firstValidHrefOk('button#btn7, a#btn1, button#btn1, a[href*="learn_more.php"]');
                 if (s2) return s2;
             } else if (sNum === 3) {
-                const s3 = document.getElementById('tp-snp2') ||
-                           document.getElementById('cross-snp2') ||
-                           document.querySelector('button.button-61, button#tp-snp2, button#cross-snp2, .button-61, a.button-61, a[href*="learn_more.php"], a[href*="vplink"], a[href*="mediafire"]');
+                const s3btn = document.getElementById('tp-snp2') ||
+                              document.getElementById('cross-snp2');
+                if (s3btn) return s3btn;
+                const s3 = firstValidHrefOk('button.button-61, button#tp-snp2, button#cross-snp2, .button-61, a.button-61, a[href*="learn_more.php"], a[href*="vplink"], a[href*="mediafire"]');
                 if (s3) return s3;
             }
 
@@ -4634,12 +4710,13 @@
                             document.getElementById('tp-snp2') ||
                             document.getElementById('btn7') ||
                             document.getElementById('btn1') ||
-                            document.querySelector('button.button-61, .button-61, a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="vplink"]');
+                            firstValidHrefOk('button.button-61, .button-61, a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="vplink"]');
             if (general) return general;
 
             const cands = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"], div[role="button"]'));
             for (const el of cands) {
                 if (!isVisible(el)) continue;
+                if (!advanceHrefOk(el)) continue;
                 const txt = (el.textContent || el.value || '').trim().toLowerCase();
                 if (/^(continue|get link|next step|proceed|click here to continue)$/i.test(txt) ||
                     (txt.length < 35 && /continue|get link|next step/i.test(txt))) {
@@ -4652,8 +4729,9 @@
         const cleanHost = host.replace(/^www\./, '');
         const stepBadge = `${stepLabel} (${cleanHost})`;
         const PACED_STEP_FLOOR_SEC = 15; // Minimum 15-second pacing floor required by backend server
+        const PACED_STEP_CEIL_SEC = 30; // Never pace longer: overlong reads are page furniture, not timers
         const detectedWait = readCountdownValue();
-        let targetDuration = Math.max(PACED_STEP_FLOOR_SEC, (detectedWait != null && detectedWait > 0) ? detectedWait : PACED_STEP_FLOOR_SEC);
+        let targetDuration = Math.max(PACED_STEP_FLOOR_SEC, Math.min(PACED_STEP_CEIL_SEC, (detectedWait != null && detectedWait > 0) ? detectedWait : PACED_STEP_FLOOR_SEC));
         let totalSec = targetDuration;
         const startTime = Date.now();
 
@@ -4761,6 +4839,7 @@
     let pacedAdvanceInProgress = false;
     let recoveryTier = 0;
     let recoveryTimer = null;
+    let lateCtaWatchArmed = false; // one late-CTA watch per step page (reset on fresh advance)
 
     async function executePacedStepAdvance(stepNum, isRecovery = false) {
         if (pacedAdvanceInProgress && !isRecovery) return;
@@ -4784,6 +4863,7 @@
             });
         } else {
             recoveryTier = 0;
+            lateCtaWatchArmed = false;
             console.log(`[KillURL] Advancing paced step ${stepNum}...`);
             renderSmartBar({
                 step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
@@ -4879,9 +4959,29 @@
             try { b61.click(); } catch (e) {}
         }
 
-        // Find primary advance CTA
-        const advanceCTA = findPacedAdvanceCTA(stepNum);
+        // Find primary advance CTA (honeypot/error anchors are filtered inside)
+        let advanceCTA = findPacedAdvanceCTA(stepNum);
+        // Defense in depth: never click an anchor whose href is a honeypot or
+        // error page (e.g. poisoned MediaFire /<key>/<name>/<junk> decoys).
+        if (advanceCTA && advanceCTA.tagName === 'A') {
+            try {
+                const ch = (advanceCTA.getAttribute('href') || '').trim();
+                if (ch && ch !== '#' && !ch.startsWith('javascript:') && (!isValidDestination(ch) || isErrorDestination(ch))) {
+                    console.log('[KillURL] Refusing to advance via honeypot/error link:', ch.slice(0, 100));
+                    advanceCTA = null;
+                }
+            } catch (e) { advanceCTA = null; }
+        }
         let anchor = advanceCTA?.tagName === 'A' ? advanceCTA : (advanceCTA?.closest('a[href]') || document.querySelector('a[href*="learn_more.php"], a[href*="bcsakhi"], a[href*="educatestudies"], a[href*="vplink"]'));
+        if (anchor && anchor !== advanceCTA) {
+            try {
+                const ah = (anchor.getAttribute('href') || '').trim();
+                if (!ah || ah === '#' || ah.startsWith('javascript:') || !isValidDestination(ah) || isErrorDestination(ah)) {
+                    console.log('[KillURL] Skipping invalid advance anchor:', (ah || '(empty)').slice(0, 100));
+                    anchor = null;
+                }
+            } catch (e) { anchor = null; }
+        }
 
         if (advanceCTA) {
             if (advanceCTA.tagName === 'A') advanceCTA.setAttribute('target', '_self');
@@ -4894,9 +4994,15 @@
             try { anchor.click(); } catch (e) {}
         }
 
-        // Fallback direct navigation if click hasn't left the page after 450ms
+        // Fallback direct navigation if click hasn't left the page after 450ms.
+        // Validated: honeypot/error hrefs must never become navigations.
         const targetHref = anchor?.getAttribute('href') || advanceCTA?.getAttribute('href');
-        if (targetHref && !targetHref.startsWith('#') && !targetHref.startsWith('javascript:')) {
+        const targetHrefOk = targetHref && !targetHref.startsWith('#') && !targetHref.startsWith('javascript:') &&
+            isValidDestination(targetHref) && !isErrorDestination(targetHref);
+        if (!targetHrefOk && targetHref && !targetHref.startsWith('#') && !targetHref.startsWith('javascript:')) {
+            console.log('[KillURL] Fallback navigation blocked (error/honeypot href):', String(targetHref).slice(0, 100));
+        }
+        if (targetHrefOk) {
             try {
                 const u = new URL(targetHref, window.location.href);
                 setTimeout(() => {
@@ -4927,13 +5033,15 @@
                     for (const b of buttons) {
                         const dHref = b.getAttribute('data-href') || b.getAttribute('data-url') || b.getAttribute('data-link');
                         if (dHref && !dHref.startsWith('#') && !dHref.startsWith('javascript:')) {
-                            const res = new URL(dHref, window.location.href).href;
+                            let res = null;
+                            try { res = new URL(dHref, window.location.href).href; } catch (e) { continue; }
+                            if (!isValidDestination(res) || isErrorDestination(res)) continue;
                             console.log('[KillURL] Self-Recovery Tier 1 found data-href:', res);
                             window.location.href = res;
                             return;
                         }
                     }
-                    if (targetHref) {
+                    if (targetHrefOk) {
                         try {
                             const u = new URL(targetHref, window.location.href);
                             console.log('[KillURL] Self-Recovery Tier 1 navigating to targetHref:', u.href);
@@ -4959,6 +5067,9 @@
                             const uPath = u.pathname.toLowerCase();
                             if (targetPatterns.some(p => uHost.includes(p) || uPath.includes(p))) {
                                 if (u.href !== window.location.href && (uPath !== window.location.pathname || u.search !== window.location.search)) {
+                                    // Honeypot/error hrefs (poisoned MediaFire decoys) are
+                                    // never valid forward targets.
+                                    if (!isValidDestination(u.href) || isErrorDestination(u.href)) continue;
                                     console.log('[KillURL] Self-Recovery Tier 2 navigating directly to forward target:', u.href);
                                     window.location.href = u.href;
                                     return;
@@ -4966,10 +5077,62 @@
                             }
                         } catch (e) {}
                     }
+                    // Nothing found: live articles inject the Continue UI via
+                    // AJAX AFTER pacing ends, so watch up to 20s for a late
+                    // CTA before escalating to the (capped) reload tier.
+                    if (!lateCtaWatchArmed) {
+                        lateCtaWatchArmed = true;
+                        const watchT0 = Date.now();
+                        console.log('[KillURL] Self-Recovery: Tier 2 found nothing — watching 20s for late-injected CTA');
+                        renderSmartBar({
+                            step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
+                            message: 'Step timer done • Waiting for the Continue button to appear...',
+                            telemetry: '🔍 Late-CTA Watch • AJAX-Injected Button Expected',
+                            icon: '🔍',
+                            isReady: false
+                        });
+                        const lateInt = setInterval(() => {
+                            try {
+                                if (window.location.href !== navFrom) { clearInterval(lateInt); return; }
+                                if (findPacedAdvanceCTA(stepNum)) {
+                                    clearInterval(lateInt);
+                                    console.log('[KillURL] Late CTA appeared — advancing now');
+                                    executePacedStepAdvance(stepNum, true);
+                                    return;
+                                }
+                                if (Date.now() - watchT0 > 20000) {
+                                    clearInterval(lateInt);
+                                    executePacedStepAdvance(stepNum, true);
+                                }
+                            } catch (e) { try { clearInterval(lateInt); } catch (e2) {} }
+                        }, 500);
+                        return;
+                    }
                     executePacedStepAdvance(stepNum, true);
                 } else {
-                    // Tier 3 (4.0s): Session-Preserved Autonomous Auto-Reload
+                    // Tier 3 (4.0s): Session-Preserved Autonomous Auto-Reload —
+                    // capped so a permanently failing step can't refresh itself
+                    // forever. Key is per (host, step) with a 10-minute window.
+                    let autoReloads = 0;
+                    const reloadKey = 'kuReloads:' + currentHost + ':' + stepNum;
+                    try {
+                        const rec = JSON.parse(sessionStorage.getItem(reloadKey) || 'null');
+                        if (rec && (Date.now() - rec.t) < 10 * 60 * 1000) autoReloads = rec.n || 0;
+                    } catch (e) { /* ignore */ }
+                    if (autoReloads >= 2) {
+                        console.log('[KillURL] Self-Recovery: Tier 3 auto-reload budget spent — parking for manual action');
+                        pacedAdvanceInProgress = false;
+                        renderSmartBar({
+                            step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
+                            message: 'Auto-advance is stuck on this step — click its Continue button manually.',
+                            telemetry: '⚠️ Auto-Recovery Parked • Manual Click May Proceed',
+                            icon: '⚠️',
+                            isReady: true
+                        });
+                        return;
+                    }
                     console.log('[KillURL] Self-Recovery: Tier 3 - Performing session-preserved autonomous auto-reload');
+                    try { sessionStorage.setItem(reloadKey, JSON.stringify({ n: autoReloads + 1, t: Date.now() })); } catch (e) { /* ignore */ }
                     renderSmartBar({
                         step: (stepNum === 3) ? `FINAL STEP 3/3 (${currentHost})` : `STEP ${stepNum}/3 (${currentHost})`,
                         message: 'Self-Recovery active • Auto-refreshing to clear transit lock...',
@@ -5001,6 +5164,8 @@
 
         let turnstileSolvedT = null;
         let pollCount = 0;
+        let vplinkCtaClicks = 0;
+        let lastVplinkCtaClickT = 0;
         console.log('[KillURL] Vplink Final Controller (zero-fingerprint mode) on:', window.location.href);
 
         renderSmartBar({
@@ -5038,14 +5203,16 @@
                     }
                 } catch (e) { /* ignore */ }
             }
-            // Also scan all anchors for any final destination link
+            // Also scan all anchors — but ONLY for file-host destinations.
+            // A bare "first external link" scan would harvest Telegram promo /
+            // join-channel links (t.me is a valid arrival, never the file).
             try {
                 const allAnchors = document.querySelectorAll('a[href]');
                 for (const a of allAnchors) {
                     const href = (a.getAttribute('href') || '').trim();
                     if (!href || href.startsWith('#') || href.startsWith('javascript:')) continue;
                     if (href.includes(window.location.hostname)) continue;
-                    if (/^https?:\/\//i.test(href) && isValidDestination(href) && !isErrorDestination(href)) {
+                    if (/^https?:\/\//i.test(href) && isValidDestination(href) && !isErrorDestination(href) && isFileDestinationUrl(href)) {
                         return href;
                     }
                 }
@@ -5145,16 +5312,44 @@
                     processCandidateDestination(ctaHref);
                     return;
                 }
-                try {
-                    dispatchFullClickSequence(ctaBtn);
-                } catch (e) {
-                    try { ctaBtn.click(); } catch (e2) {}
+                // The CTA href is not (yet) the file link. Clicking is only
+                // safe when it CANNOT loop: a same-host vplink→vplink href (or
+                // an error/honeypot href) must never be clicked — each click
+                // re-opens the same vplink page forever. Wait for the real
+                // off-host file link instead.
+                let loopsBack = false;
+                if (ctaHref && !ctaHref.startsWith('#') && !ctaHref.startsWith('javascript:')) {
+                    try {
+                        const u = new URL(ctaHref, window.location.href);
+                        loopsBack = u.hostname.replace(/^www\./, '').toLowerCase() ===
+                            window.location.hostname.replace(/^www\./, '').toLowerCase();
+                    } catch (e) { loopsBack = true; }
+                    if (!loopsBack && isErrorDestination(ctaHref)) loopsBack = true;
+                }
+                if (loopsBack) {
+                    if (pollCount % 100 === 0) console.log('[KillURL] vplink CTA still points at vplink itself — holding, not clicking (loop guard)');
+                } else if (vplinkCtaClicks < 6 && Date.now() - lastVplinkCtaClickT > 3000) {
+                    vplinkCtaClicks++;
+                    lastVplinkCtaClickT = Date.now();
+                    try {
+                        dispatchFullClickSequence(ctaBtn);
+                    } catch (e) {
+                        try { ctaBtn.click(); } catch (e2) {}
+                    }
                 }
             }
 
-            // After 60 seconds of post-turnstile polling (600 iterations at 100ms), stop polling
-            if (pollCount >= 600) {
+            // After ~2 minutes of post-turnstile polling (1200 iterations at
+            // 100ms), stop polling and say so instead of spinning silently.
+            if (pollCount >= 1200) {
                 clearInterval(vplinkPoll);
+                renderSmartBar({
+                    step: 'MEDIAFIRE ACCESS',
+                    message: 'Still waiting for the MediaFire link — click Get Link manually if it is ready.',
+                    telemetry: '⏳ Auto-Wait Finished • Manual Click May Proceed',
+                    icon: '⏳',
+                    isReady: true
+                });
             }
         }, 100);
 
@@ -5634,6 +5829,23 @@
         }
     }
 
+    // File-host destinations only (MediaFire, Mega, Drive, …). Social/app
+    // finals like t.me or play.google.com are legitimate *arrivals* when
+    // navigated to, but must never be harvested as "the download" from
+    // promo/join links sitting on intermediate shortener pages.
+    const FILE_HOST_RE = /^(mediafire\.com|mega\.(nz|io)|drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com|dropbox\.com|dropboxusercontent\.com|onedrive\.live\.com|1drv\.ms|sharepoint\.com|gofile\.io|pixeldrain\.com|pixeldra\.in|terabox\.com|teraboxapp\.com|1024terabox\.com|terasharelink\.com|workupload\.com|krakenfiles\.com|sendspace\.com|send\.cm|filemail\.com|wetransfer\.com|we\.tl|icedrive\.net|pcloud\.com|box\.com|app\.box\.com)$/i;
+
+    function isFileDestinationUrl(url) {
+        try {
+            const sites = window.KILLURL_SITES || (typeof globalThis !== 'undefined' ? globalThis.KILLURL_SITES : null);
+            if (sites && typeof sites.isFileDestination === 'function') return sites.isFileDestination(url);
+            if (isErrorDestination(url)) return false;
+            const hn = new URL(url, window.location.href).hostname.replace(/^www\./, '').toLowerCase();
+            if (FILE_HOST_RE.test(hn)) return true;
+            return hn.endsWith('.mediafire.com') || hn.endsWith('.mega.nz') || hn.endsWith('.terabox.com');
+        } catch (e) { return false; }
+    }
+
     // ===== PREMATURE CLICK GUARD =====
     // Intercept and block user clicks on Continue / Next buttons while a countdown
     // is ticking down. Clicking these before the server-side timer elapses invalidates
@@ -5651,7 +5863,11 @@
             }
             const rem = readCountdownValue();
             const live = countdownIsLive();
-            if ((rem != null && rem > 0) || live) {
+            // Liveness only — never a raw `rem > 0`. A stuck misread (e.g. a
+            // frozen 306s) would otherwise block clicks forever; `live`
+            // expires ~12s after the value stops moving, so the page
+            // self-unblocks while genuine ticking timers stay guarded.
+            if (live) {
                 const btn = e.target?.closest?.('a, button, input[type="submit"], input[type="button"], [role="button"]');
                 if (btn) {
                     const text = (((btn.textContent || btn.value || '') + ' ' + (btn.id || '')).trim()).toLowerCase();

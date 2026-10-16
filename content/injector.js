@@ -265,8 +265,13 @@
             const u = String(url).trim();
             if (!u || u === 'about:blank' || u.startsWith('javascript:')) return true;
             if (BAIT_URL_RE.test(u) || AD_POPUP_RE.test(u) || ERROR_DEST_RE.test(u)) return true;
-            // MediaFire check: error pages are invalid destinations
-            if (/mediafire\.com/i.test(u) && !/mediafire\.com\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]+|mediafire\.com\/\?[a-zA-Z0-9_-]{5,}/i.test(u)) return true;
+            // MediaFire check: error pages AND honeypot decoys
+            // (/<key>/<name>/<junk> instead of an authentic /file suffix) are
+            // never destinations — following one lands on a dead "key invalid" page
+            if (/mediafire\.com/i.test(u)) {
+                if (/mediafire\.com\/(?:file|download)\/[a-zA-Z0-9_-]+\/[^\/]+\/(?!file(?:[\/?#]|$))[^\/?#]+/i.test(u)) return true;
+                if (!/mediafire\.com\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]+|mediafire\.com\/\?[a-zA-Z0-9_-]{5,}/i.test(u)) return true;
+            }
             if (/[?&](zoneid|bannerid|campaignid|pubid|direct_link|popunder|popup|clickid|ad_id)=/i.test(u)) return true;
             if (/^data:text\/html/i.test(u) && /script|window\.open|location/i.test(u)) return true;
         } catch (e) { return true; }
@@ -1270,8 +1275,13 @@
         if (ERROR_DEST_RE.test(url)) return false;
         if (BAIT_URL_RE.test(url)) return false;
         if (/google|doubleclick|analytics|facebook|taboola/i.test(url)) return false;
-        // MediaFire check: if host is mediafire.com, must be an authentic file/download/folder/view link
+        // MediaFire check: must be an authentic file/download/folder/view link.
+        // Honeypot decoys (/<key>/<name>/<junk> instead of an authentic /file
+        // suffix) are poisoned links that land on a dead "key invalid" page.
         if (/mediafire\.com/i.test(url)) {
+            if (/mediafire\.com\/(?:file|download)\/[a-zA-Z0-9_-]+\/[^\/]+\/(?!file(?:[\/?#]|$))[^\/?#]+/i.test(url)) {
+                return false;
+            }
             if (!/mediafire\.com\/(?:file|download|folder|view)\/[a-zA-Z0-9_-]+|mediafire\.com\/\?[a-zA-Z0-9_-]{5,}/i.test(url)) {
                 return false;
             }
